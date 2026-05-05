@@ -1,0 +1,2461 @@
+---
+title: "HELP Analysis"
+author: "Mohammed Sherif Amin"
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    self_contained: true
+    theme: cosmo
+    toc_float:
+      collapsed: true
+      smooth_scroll: true
+  bookdown::pdf_document2:
+    toc: true
+    number_sections: true
+    keep_tex: true
+fontsize: 12pt
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+
+rm(list = ls())
+knitr::opts_chunk$set(
+  echo = TRUE,    
+  warning = FALSE,   
+  message = FALSE,
+  fig.width = 10, 
+  fig.height = 12, 
+  tidy = TRUE, 
+  tidy.opts = list(width.cutoff = 60),
+  cache = TRUE
+)
+
+# Load required packages
+library(knitr)
+library(readODS) # for read_ods
+library(readxl) # for read_excel
+library(zip) # for uzip()
+library(tidyverse)
+library(purrr)
+library(janitor) # for clean_names
+library(gtsummary) # for tbl_summary
+library(scales) # for percent 
+library(naniar) # dealing with missing data
+library(glue)# for function glue
+library(gt) # for functions gt() and tab_caption()
+library(scales) # for functions percent() and comma()
+library(stringr) # for str_ functions 
+library(fingertipsR) # to extract data from fingertips using fingertips_data()
+library(microsynth) # The synthetic control package. For functions: synth() & plot_microsynth()
+library(ggcorrplot) #for ggcorrplot()
+library(patchwork) # for merging more than one using plot_layout()
+library(sf) # for all spatial functions 
+library(survey) # for svydesign() and svymean()
+library(flowchart) # for fc_..() functions
+library(flextable) # for as_flex_table() and footnote()
+
+
+#Loading the file that has some custom functions
+source("scripts/functions.R")
+```
+
+# Vaccine Uptake Data
+
+## Overview
+
+Vaccine uptake data for general practices (GPs) were obtained from the UK Health Security Agency’s [COVER data set](https://www.gov.uk/government/statistics/cover-of-vaccination-evaluated-rapidly-cover-programme-2024-to-2025-quarterly-data), spanning 24 quarters (Q1: Apr-Jun 2019 to Q24: Jan-Mar 2025). Each quarter file includes multiple sheets, of which only those containing GP-level data (i.e., sheets with \>5,000 rows) were retained.
+
+The section runs as follows:
+
+-   Downloading and cleaning uptake data
+-   Handling missingness
+-   Summary of the data after cleaning
+
+## Loading and Cleaning the Data
+
+To ensure consistency across time points:
+
+-   Column names were standardised (e.g., `gpcode`, `mmr1_24m`, `mmr2_5y`).
+-   A `time` and `time_label` variable were added to denote the quarter.
+-   Duplicate rows were resolved by retaining only the record with the most complete information.
+
+```{r loading and harmonise data tables, echo=TRUE, cache=TRUE}
+# -----------------------------
+#  Loading data
+# -----------------------------
+
+
+# Adding all data files paths in a single list
+ods_files <- list.files("data/uptake", pattern = "\\.ods$", full.names = TRUE)
+
+# Creating an empty list that will use to add data
+gp_data <- list()
+
+#Loop and read through the files
+for (file in ods_files){
+  sheets <- readODS::list_ods_sheets(file)
+  
+  for (sheet in sheets){
+    
+    raw_data <- read_ods(file, sheet = sheet)
+    
+    #The idea is to filter the data to go directly to the headers row (i.e., the first row with complete values)
+    #The give me the row numbers of rows with complete values. 
+    non_na_rows <- which(rowSums(is.na(raw_data))== 0) 
+    
+    if (length(non_na_rows>0)){
+      first_data_row <- first(non_na_rows)
+      
+      #Then I will read the data again with the correct headers
+      data <- read_ods(file, sheet = sheet, skip = first_data_row)
+      
+      #Only return sheets with more than 5000 rows (i.e., the GP uptake, as each file has multiple sheets)
+      if (nrow(data) > 5000)
+        gp_data[[paste0(basename(file))]] <- data
+    }
+  }
+}
+
+
+rm(list = setdiff(ls(), "gp_data"))
+
+
+
+# -----------------------------
+#  Harmonise data tables
+# -----------------------------
+
+# Change all data tables into a consistent format for later merging 
+harmonised_gp_data <- gp_data %>% 
+  map(~ .x %>% 
+        janitor::clean_names() %>% 
+        rename_with(~case_when(
+          str_detect(., "practice_code|gpcode|general_practice_code|gp_code") ~ "gpcode",
+          str_detect(., "number_of_children_who_reached_12_months|12m_denominator|12_month_denominator") ~ "den_12m",
+          str_detect(., "number_of_children_who_reached_24_months|24m_denominator|24_month_denominator") ~ "den_24m",
+          str_detect(., "number_of_children_who_reached_5_years|5y_denominator|5_year_denominator") ~ "den_5y",
+          str_detect(., "x?24_month_mmr1|24m_mmr1|coverage_at_24_months_mmr1") ~ "mmr1_24m",
+          str_detect(., "x?5_year_mmr1|5y_mmr1|coverage_at_5_years_mmr1") ~ "mmr1_5y",
+          str_detect(., "x?5_year_mmr2|5y_mmr2|coverage_at_5_years_mmr2") ~ "mmr2_5y", 
+          str_detect(., "x12m_d_ta_p_ipv_hib_percent|x12m_d_ta_p_ipv_hib_hep_b_percent|x12_month_d_ta_p_ipv_hib_hep_b_percent|x12m_d_ta_pipv_hib_hep_b_percent|coverage_at_12_months_d_ta_p_ipv_hib_hep_b_percent") ~
+            "6_in_1", 
+          str_detect(., "x12_month_rota_percent|x12m_rota_percent|coverage_at_12_months_rota_percent") ~ "rota",
+          str_detect(., "x24m_pcv_booster_percent|x24_month_pcv_booster_percent|coverage_at_24_months_pcv_booster_percent") ~ "pcv_boost",
+          TRUE ~ .
+        )) %>%
+        select(any_of(c("gpcode", "den_12m", "den_24m", "den_5y", "mmr1_24m", "mmr1_5y", "mmr2_5y", "6_in_1", "rota", "pcv_boost"))))
+
+# -----------------------------
+#  Add time labels
+# -----------------------------
+
+#adjusting the order and adding a time point to each. NOTE: I will be adding two formats, a one for the analysis (`time`)
+#where it starts from quarter 1 (at April_June 2019 ) and ends at quarter 24(January_March 2025). 
+#The `time_label` is for readability
+correct_order <- c(
+  "2019_April_June.ods",
+  "2019_July_September.ods",
+  "2019_October_December.ods",
+  "2020_January_March.ods",
+  "2020_April_June.ods",
+  "2020_July_September.ods",
+  "2020_October_December.ods",
+  "2021_January_March.ods",
+  "2021_April_June.ods",
+  "2021_July_September.ods",
+  "2021_October_December.ods",
+  "2022_January_March.ods",
+  "2022_April_June.ods",
+  "2022_July_September.ods",
+  "2022_October_December.ods",
+  "2023_January_March.ods",
+  "2023_April_June.ods",
+  "2023_July_September.ods",
+  "2023_October_December.ods",
+  "2024_January_March.ods",
+  "2024_April_June.ods",
+  "2024_July_September.ods",
+  "2024_October_December.ods",
+  "2025_January_March.ods"
+)
+
+harmonised_gp_data <- harmonised_gp_data[correct_order]
+
+harmonised_gp_data <- imap(harmonised_gp_data, ~
+                             .x %>%
+                             mutate(
+                               time = which(correct_order == .y),  # find the position in correct_order (i.e., order the quarters)
+                               time_label = str_remove(.y, "\\.ods*$")  # adding a clean label (just to double check)
+                             )
+)
+
+
+# -----------------------------
+#  Bind all rows into one dataframe
+# -----------------------------
+
+harmonised_gp_data <- harmonised_gp_data %>%
+  map(~ mutate(.x, across(everything(), as.character))) %>%
+  bind_rows(.id = "file")
+
+
+# --- Diagnostics A total rows before cleaning ---
+total_rows <- nrow(harmonised_gp_data)
+total_uniq_gps <- harmonised_gp_data %>% select(gpcode) %>% n_distinct()
+paste0("Total rows before any filtering:", total_rows, " (" , total_uniq_gps, " Unique GPs)")
+
+
+# --------------------------
+# Creating a flow diagram of the study sample 
+# --------------------------
+
+flow_chart <- harmonised_gp_data %>% 
+  as_fc(label = paste0("GP practices assessed for eligibility", "\n (", total_uniq_gps, " GP)"), 
+        text_pattern = paste0("{label}\n {n}", " rows"), text_fs = 10) 
+
+
+# -----------------------------
+#  Remove V81999/V81997 rows (the code for missing information)
+# -----------------------------
+
+# V81999_count <- map_int(harmonised_gp_data, ~ filter(.x, str_detect(tolower(gpcode), "^v8199*")) %>% nrow()) %>% sum()
+# V81999_pct <- percent((V81999_count / total_rows), accuracy = 0.01)
+harmonised_gp_data <- harmonised_gp_data %>% filter(!str_detect(tolower(gpcode), "^v8199*"))
+
+# --- Diagnostics B after removing V81999 ---
+total_after_v81999 <- nrow(harmonised_gp_data)
+count_v81999 <- total_rows - total_after_v81999
+pct_v81999 <- percent((count_v81999 / total_rows), accuracy = 0.01)
+
+
+cat("After removing V81999/V81997:", total_after_v81999, "rows (removed", count_v81999, "[",pct_v81999 ,"]", ")")
+
+# -----------------------------
+# Check duplicates
+# -----------------------------
+
+# checking for duplicates per file
+duplicate_rows <- harmonised_gp_data %>% 
+  group_by(time) %>%
+  summarise(n_dups = sum(duplicated(gpcode))) %>%
+  summarise(total_dups = sum(n_dups)) %>%
+  pull(total_dups)
+
+
+# -----------------------------
+#  Keep the most complete record per GP
+# -----------------------------
+
+# filter to keep the row with the maximum number of non missing values 
+harmonised_gp_data <- harmonised_gp_data %>%
+                            group_by(time, gpcode) %>%
+                            filter(rowSums(!is.na(across(everything()))) == max(rowSums(!is.na(across(everything()))))) %>%
+                            slice(1) %>% # in case the number of non-missing is the same, take the first row
+                            ungroup()
+
+
+# --- Diagnostics D after deduplication ---
+total_after_dedup <- nrow(harmonised_gp_data)
+cat("After deduplication:", total_after_dedup, "rows (removed", total_after_v81999 - total_after_dedup, ")\n")
+
+
+gpmmr <- harmonised_gp_data
+
+# --- Diagnostics E final check ---
+cat("Final gpmmr row count:", nrow(gpmmr))
+cat("Expected (approx):", total_rows - count_v81999 - duplicate_rows)
+cat("Difference:", (total_rows - count_v81999 - duplicate_rows) - nrow(gpmmr))
+
+# -----------------------------
+# Adjusting the flow chart
+# -----------------------------
+
+
+total_uniq_gps_2 <- gpmmr %>% select(gpcode) %>% n_distinct()
+
+text_ex1 <- paste0(total_uniq_gps - total_uniq_gps_2, " Excluded GPs (",
+  sum(count_v81999, duplicate_rows, na.rm = TRUE), " rows)\n",
+  "     ",
+  sum(count_v81999, na.rm = TRUE),
+  " Rows with missing data code (V81999/V81997)\n",
+  "     ",
+  sum(duplicate_rows, na.rm = TRUE),
+  " Duplicated rows"
+)
+
+
+flow_chart1 <- flow_chart %>% 
+  fc_filter(N = nrow(gpmmr),text_pattern = paste0("{label}\n {n} rows ({perc}%)"),
+            label = paste0("After initial data filtering", "\n (", total_uniq_gps_2 , " GP)"),
+            show_exc = TRUE, text_fs = 10, text_fs_exc = 8) %>% 
+  fc_modify( # modifying only box 3 - exclusions
+    ~ .x %>% 
+      dplyr::mutate(
+        text = ifelse(id == 3, text_ex1, text),
+        just = ifelse(id == 3, "left", "center"),
+        x = ifelse(id == 3, x + 0.11, x)
+      ))
+
+
+```
+
+**Note:** As part of data cleaning, GPs with missing identifiers (e.g., `gpcode` == "V81999") were removed. These added to a total of `r count_v81999` GPs (`r pct_v81999` of the sample).
+
+## Handling Missingness
+
+### Handling Suppressed Values
+
+Some entries in the dataset (Table:\@ref(tab:suppressed-values-table)) were affected by disclosure control and rounding practices.
+
+```{r suppressed-values-table, echo=TRUE, cache=TRUE}
+
+# ----------------------------------------------------------
+#  Checking weird entries that arise from data disclosure controls and rounding practices.
+# ----------------------------------------------------------
+
+gpmmr %>%
+  select(den_12m, den_24m, den_5y, mmr1_24m, mmr1_5y, mmr2_5y, `6_in_1`, rota, pcv_boost) %>% 
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+  filter(!str_detect(value, "^\\d+(\\.\\d+)?$")) %>%
+  count(value, name = "Frequency") %>%
+  mutate(
+    Percentage = percent(Frequency / sum(Frequency), accuracy = 0.1),
+    value = if (is_latex_output()) { # this part is to escape the % as it cause an error when knitting as pdf
+      value %>%
+        str_replace_all("%", "\\\\%") %>%
+        str_replace_all("\\[", "\\\\[") %>%
+        str_replace_all("\\]", "\\\\]") %>%
+        str_replace_all("\\*", "\\\\*")
+    } else {
+      value
+    }
+  ) %>%
+  arrange(desc(Frequency)) %>%
+  gt() %>%
+  tab_caption("Frequency of suppressed or non-numeric entries")
+```
+
+These values were handled using the replacement strategy outlined below:
+
+-   **Ranges** (e.g., "0% to 34%") were replaced by their midpoint:
+    -   "0% to 34%" -\> 17
+    -   "35% to 69%" / "35.0% to 69.0%" -\> 52
+    -   "70% to 100%" / "70.0% to 100%" -\> 85
+-   **Suppressed values** (`*`, `[note 1]`) were replaced with a random number between 1 and 4 to reflect suppression thresholds.
+-   **Non-numeric artifacts** like `NaN` was treated as missing (`NA`).
+-   `[note 2]` indicates that the value has been removed to protect confidentiality due to suppression elsewhere (i.e. not because of its own value). It does not imply a known numerical range, hence, was treated as a true missing value (`NA)`.
+-   Where the **denominator** was 0, corresponding `NA` uptake values were replaced with 0.
+
+```{r Handling suppressed and non-Numeric values, echo=TRUE, cache=TRUE}
+
+# ----------------------------------------------------------
+#  Handle suppressed and non-numeric values
+# ----------------------------------------------------------
+
+set.seed(123)  
+
+gpmmr_c <- gpmmr %>%
+  mutate(across(c("den_12m", "den_24m", "den_5y", "rota", "6_in_1", "mmr1_24m", "pcv_boost", "mmr1_5y", "mmr2_5y"), ~ case_when(
+    .x %in% c("0% to 34%") ~ "17",
+    .x %in% c("35% to 69%", "35.0% to 69.0%") ~ "52",
+    .x %in% c("70% to 100%", "70.0% to 100%") ~ "85",
+    str_detect(.x, "^[Nn]a[Nn]$") ~ NA_character_,
+    .x %in% c("[note 2]") ~ NA_character_, 
+    .x %in% c("*", "[note 1]", "[note1]") ~ as.character(sample(1:4, 1)),
+    TRUE ~ .x
+  )))
+
+
+# Changing all into numeric 
+gpmmr_c <- gpmmr_c %>%
+  mutate(across(
+    c("den_12m", "den_24m", "den_5y", "rota", "6_in_1", "mmr1_24m", "pcv_boost", "mmr1_5y", "mmr2_5y", "time"),
+    as.numeric)) %>%
+  mutate(time = as.integer(time)) %>% arrange(time)
+
+
+# Replace NA uptake values with 0 when the corresponding denominator is 0
+gpmmr_c <- gpmmr_c %>%
+  mutate(
+    rota       = case_when(den_12m == 0 ~ 0, TRUE ~ rota),
+    `6_in_1`   = case_when(den_12m == 0 ~ 0, TRUE ~ `6_in_1`),
+    
+    mmr1_24m   = case_when(den_24m == 0 ~ 0, TRUE ~ mmr1_24m),
+    pcv_boost  = case_when(den_24m == 0 ~ 0, TRUE ~ pcv_boost),
+    
+    mmr1_5y    = case_when(den_5y == 0  ~ 0, TRUE ~ mmr1_5y),
+    mmr2_5y    = case_when(den_5y  == 0  ~ 0, TRUE ~ mmr2_5y)
+  )
+
+```
+
+### Missing Values
+
+Missing values (Table: \@ref(tab:tbl-missing)) were imputed using a simple rule-based approach that respected the time-series structure of the data. Specifically:
+
+-   If a GP had a missing value between two known values (e.g., Q10 missing but Q9 and Q11 available), we carried forward the previous value.
+-   If the first quarter (Q1) was missing but Q2 was available, we copied Q2 back to Q1.
+-   If the last quarter (Q24) was missing but Q23 was available, we copied Q23 forward to Q24.
+-   GPs with missing values that could not be filled using this logic (e.g., two or more consecutive missing quarters) were excluded.
+
+This simple logic allowed us to retain as many GPs as possible without introducing artificial trends.
+
+```{r tbl-missing, echo=TRUE, cache=TRUE}
+
+# ----------------------------------------------------------
+# Assess remaining missing values
+# ----------------------------------------------------------
+
+naniar::miss_var_summary(gpmmr_c) %>%
+  gt() %>%
+  tab_caption(
+   "Frequency of missing values in the data")
+
+```
+
+```{r Impute missing quarters, echo=TRUE, cache=TRUE}
+
+# ----------------------------------------------------------
+# Impute missing quarters (time-series continuity rule)
+# ----------------------------------------------------------
+
+# Identifying the missing variables to impute
+vars_to_impute <- c("den_12m", "den_24m", "den_5y",
+                    "rota", "6_in_1", "mmr1_24m",
+                    "pcv_boost", "mmr1_5y", "mmr2_5y")
+
+
+# Get unique gpcode and time values
+all_gps <- unique(gpmmr_c$gpcode)
+time_labels <- gpmmr_c %>%
+  select(time, time_label) %>%
+  distinct()
+
+# Create full grid of gpcode × time, ensuring that every GP has 24 time points
+complete_template <- expand_grid(gpcode = all_gps, time = time_labels$time) %>%
+  left_join(time_labels, by = "time")
+
+# Adding the data to the empty grid
+gpmmr_final <- complete_template %>%
+  left_join(gpmmr_c, by = c("gpcode", "time", "time_label")) %>%
+  arrange(gpcode, time)
+
+
+#Applying the logic 
+gpmmr_final <- gpmmr_final %>%
+  group_by(gpcode) %>%
+  mutate(across(all_of(vars_to_impute),
+                ~ if_else(is.na(.x) & !is.na(lead(.x)) & time == 1, lead(.x), .x))) %>%
+  mutate(across(all_of(vars_to_impute),
+                ~ if_else(is.na(.x) & !is.na(lag(.x)) & time == 24, lag(.x), .x))) %>%
+  mutate(across(all_of(vars_to_impute),
+                ~ if_else(is.na(.x) & !is.na(lag(.x)) & !is.na(lead(.x)), lag(.x), .x))) %>%
+  ungroup()
+
+
+#Filtering out values that were not imputed
+gpmmr_final <- gpmmr_final %>%
+  group_by(gpcode) %>%
+  filter(if_any(all_of(vars_to_impute), ~ !is.na(.))) %>%
+  drop_na() %>%
+  mutate(n_time = n_distinct(time)) %>%
+  filter(n_time == 24) %>%
+  ungroup()
+
+
+total_uniq_gps_3 <- gpmmr_final %>% dplyr::distinct(gpcode) %>% nrow()
+n_gps_total <- gpmmr %>% dplyr::distinct(gpcode) %>% nrow()
+pct_gps_retained <- percent(total_uniq_gps_3/n_gps_total)
+
+
+
+# Updating the flow diagram 
+flow_chart2 <- flow_chart1 %>% 
+  fc_filter(N = nrow(gpmmr_final),
+            text_pattern = paste0("{label}\n {n} rows ({perc}%)"),
+            label = paste0("GPs with complete vaccine uptake data following imputation", "\n (", total_uniq_gps_3 , " GP)"),
+            perc_total = TRUE, text_fs = 10, text_fs_exc = 8,
+            text_pattern_exc = paste0(total_uniq_gps_2 - total_uniq_gps_3 , 
+                                      " Excluded GPs ", "(", "{n}", " rows) with incomplete quaterly vaccine uptake observations"),
+                      show_exc = TRUE)  %>% 
+  fc_modify(
+    ~ .x %>% 
+      dplyr::mutate(
+        just = ifelse(id %in% c(3,5), "left", "center"),
+        x = ifelse(id == 5, x + 0.13, x)
+      ))
+
+
+# flow_chart2 %>% fc_draw(big.mark = ",")
+
+
+# saving final cleaned data as.rds
+saveRDS(gpmmr_final, "data/GP_MMR.rds")
+saveRDS(flow_chart2, file = "data/flowchart/flow_chart1.rds")
+```
+
+## Uptake Dataset Summary
+
+After harmonisation and imputation:
+
+-   In total, `r total_uniq_gps_3 %>% comma()` GPs of `r n_gps_total %>% comma()` (`r pct_gps_retained`) were retained.
+-   Each GP has a complete set of 24 time points, making a total observations of `r nrow(gpmmr_final) %>% comma()`.
+-   Uptake indicators include:
+    -   MMR1 at 24 months and 5 years
+    -   MMR2 at 5 years
+    -   6-in-1 vaccine at 12 months
+    -   Rotavirus at 12 months
+    -   PCV booster at 2 years
+    -   Denominator (i.e., number of eligible children for vaccination) at 12 month, 2 years, and 5 years.
+
+# Covariates
+
+## Deprivation Data
+
+We linked each GP practice to an area-level deprivation score using the 2025 Index of Multiple Deprivation (IMD). The IMD data were sourced from the [Fingertips public health data repository](https://fingertips.phe.org.uk/profile/general-practice/data#page/6/gid/2000005/pat/204/par/U00000/ati/7/are/D82060/iid/93553/age/1/sex/4/cat/-1/ctp/-1/yrr/1/cid/4/tbm/1), which provided GP-level weighted IMD scores. A copy of the dataset used is included among the project files under the following path: `"data/IMD/imd_25.rds"`.
+
+The deprivation dataset was linked to the GP vaccine uptake data using the `gpcode` variable. We calculated IMD deciles, where decile 1 represents the most deprived GPs and decile 10 represents the least deprived GPs.
+
+```{r link-imd-data, echo=TRUE, cache=TRUE}
+rm(list = ls())
+
+library(tidyverse)
+library(janitor)
+
+# ----------------------------------------------------------
+# Load & clean IMD 2019
+# ----------------------------------------------------------
+
+imd19 <- read.csv("data/IMD/Full dataset API deprivation scores.csv", check.names = FALSE) %>%
+  clean_names() %>%
+  filter(area_type == "GPs", time_period == "2019", sex == "Persons") %>%
+  rename(
+    gpcode   = area_code,
+    imd_2019 = value
+  ) %>%
+  select(gpcode, imd_2019) %>%
+  distinct(gpcode, .keep_all = TRUE)
+
+# ----------------------------------------------------------
+# Load & clean IMD 2025
+# ----------------------------------------------------------
+
+imd25 <- readRDS("data/IMD/imd_25.rds") %>%
+  clean_names() %>%
+  filter(area_type == "GPs", timeperiod == "2025", sex == "Persons") %>% 
+  rename(
+    gpcode   = area_code,
+    imd_2025 = value
+  ) %>%
+  select(gpcode, imd_2025)
+
+# ----------------------------------------------------------
+# Combine 2025 + 2019 and fill missing
+# ----------------------------------------------------------
+
+imd_all <- full_join(imd25, imd19, by = "gpcode") %>%
+  mutate(
+    # prefer 2025, otherwise use 2019
+    imd_2025 = if_else(!is.na(imd_2025), imd_2025, imd_2019)
+  )
+
+# ----------------------------------------------------------
+# Compute IMD deciles (1 = most deprived)
+# ----------------------------------------------------------
+
+imd_all <- imd_all %>%
+  mutate(
+    imd_decile = cut(
+      imd_2025,
+      breaks = quantile(imd_2025, probs = seq(0, 1, by = 0.1), na.rm = TRUE),
+      labels = FALSE,
+      include.lowest = TRUE
+    ),
+    imd_decile = 11 - imd_decile
+  )
+
+# ----------------------------------------------------------
+# Load GP MMR dataset & merge IMD
+# ----------------------------------------------------------
+
+gpmmr <- readRDS("data/GP_MMR.rds")
+
+gpmmr <- gpmmr %>%
+  left_join(
+    imd_all %>% select(gpcode, imd_2025, imd_decile),
+    by = "gpcode"
+  )
+
+
+missing_imd <- gpmmr %>% filter(is.na(imd_2025)) %>% select(gpcode) %>% n_distinct()
+
+#Saving the data
+saveRDS(gpmmr, "data/GP_MMR_IMD.rds")
+```
+
+`r missing_imd` GPs did not have a recorded IMD score, thus were flagged as missing.
+
+## Linking GP Practices to Higher-Level organisational units
+
+Each GP was linked to the higher-level NHS organisational units:
+
+-   Primary Care Networks (PCNs)
+-   Sub-Integrated Care Boards (Sub-ICBs)
+-   Integrated Care Boards (ICBs)
+-   NHS Regions (e.g., North West)
+
+Two public lookup tables were used for this linkage:
+
+1.  PCN Core Partner Details from the [Organisation Data Service (ODS)](https://digital.nhs.uk/services/organisation-data-service/file-downloads/other-nhs-organisations).
+
+2.  Region Names Lookup from the [NHS Business Services Authority](https://www.nhsbsa.nhs.uk/sites/default/files/2022-07/Website%20Names%20Lookup.xlsx).
+
+Copies of these datasets were downloaded and saved under the following path `"data/epcn/"`.
+
+Each GP was matched using its organisation code (`gpcode`). If a GP had multiple historical records (due to transfers between PCNs), we selected the **most recent** entry based on the absence of a relation end date.
+
+```{r link-higher-geo, echo=TRUE, cache=TRUE}
+# rm(list = ls())
+
+# #Download the icb_lookup table from this link 
+# download.file("https://digital.nhs.uk/binaries/content/assets/website-assets/services/ods/data-downloads-other-nhs-organisations/epcn.zip", 
+#               destfile = "data/epcn.zip", mode = "wb")
+# 
+# 
+# unzip("data/epcn.zip", exdir = "data/epcn")
+# 
+# #Download the region lookup to link the ICBs to Higher regions (e.g north west)
+# download.file("https://www.nhsbsa.nhs.uk/sites/default/files/2022-07/Website%20Names%20Lookup.xlsx", destfile = "data/epcn/region_lookup.xlsx", mode = "wb")
+
+# ----------------------------------------------------------
+# Load vaccine uptake dataset with IMD
+# ----------------------------------------------------------
+gpmmr <- readRDS("data/GP_MMR_IMD.rds")
+
+# Read in PCN lookup and region mapping files
+icb_look <- read_excel("data/epcn/epcn.xlsx", sheet = "PCN Core Partner Details")
+region_look <- read_excel("data/epcn/region_lookup.xlsx", 
+                          sheet = "Names w.e.f. 01.07.2022", 
+                          skip = 3)
+
+
+# ----------------------------------------------------------
+# harmonising variable names for easier joins
+# ----------------------------------------------------------
+icb_look <- icb_look %>%
+  rename(
+    gpcode       = `Partner\r\nOrganisation\r\nCode`,
+    gpname       = `Partner\r\nName`,
+    subicb_code  = `Practice\r\nParent\r\nSub ICB Loc Code`,
+    subicb_name  = `Practice\r\nParent\r\nSub ICB Loc Name`,
+    pcn_code     = `PCN Code`,
+    pcn_name     = `PCN Name`,
+    end_relation = `Practice to PCN\r\nRelationship\r\nEnd Date`
+  )
+
+region_look <- region_look %>%
+  rename(
+    subicb_code = `Sub ICB Location ODS Code`,
+    subicb_name = `Sub ICB Location Name`,
+    icb_code    = `ICB Code`,
+    icb_name    = `Integrated Care Board Name`,
+    region_name = `Region Name`,
+    region_code = `Region Code`
+  ) 
+
+# ----------------------------------------------------------
+#dropping unnecessary variables
+# ----------------------------------------------------------
+region_look <- region_look %>% select(-c(2,3,6))
+icb_look <- icb_look %>% select(-c(7,8,9,11))
+
+
+# ----------------------------------------------------------
+# Handle GPs with multiple records (due to PCN transfers)
+# ----------------------------------------------------------
+
+# Retain the most recent record (i.e., the one with NA in `end_relation`)
+icb_look <- icb_look %>%
+  group_by(gpcode) %>%
+  arrange(is.na(end_relation)) %>%  # NA end dates come last
+  slice_tail(n = 1) %>%             # Retain the latest PCN record per GP
+  ungroup()
+
+# Although we expected one record per GP, some had an 'end_relation' value
+# without an accompanying new record — indicating they exited a PCN and did not rejoin another.
+
+# Join with region lookup to bring in ICB and Region info
+icb_look <- icb_look %>%
+  left_join(region_look, by = "subicb_code") %>% select(-c(end_relation))
+
+# Merge geographic structure into main dataset
+gpmmr <- gpmmr %>%
+  left_join(icb_look, by = "gpcode")
+
+saveRDS(gpmmr, file = "data/GP_MMR_IMD_ICB.rds")
+
+rm(list = ls())
+```
+
+## GP Registered Population Data
+
+To account for the practices size overtime, we linked the count of GP-registered population by quarter using NHS Digital’s [GP Registered Population Data](https://digital.nhs.uk/data-and-information/publications/statistical/patients-registered-at-a-gp-practice).
+
+The dataset provides monthly counts of registered patients by GP practice, disaggregated by 5-year age bands (from 0–4 up to 90–94, with a final 95+ category) and by sex. For each quarter, we extracted data for the midpoint month (e.g., for a quarter spanning January to Match, the February values were used).
+
+For this analysis, we focused on:
+
+-   The total number of children aged 0–4 (`count_0_4`), as this is the primary age group relevant to the childhood vaccines being analysed.
+-   The proportion of boys within this age group (`pct_boys_0_4`).
+
+```{r link-gp-population, echo=TRUE, cache=TRUE}
+
+rm(list = ls())
+
+# Download the data ------
+# # 
+# #create a new folder to add the data to
+# dir.create("data/gp_population")
+# 
+# #File path for all the gp-registered population data, can be found on: (https://digital.nhs.uk/data-and-information/publications/statistical/patients-registered-at-a-gp-practice)
+# urls<- c(
+# "https://files.digital.nhs.uk/5A/22D4C1/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/34/609406/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/CB/C94127/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/40/3CEF8A/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/7F/C526F5/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/16/3B7597/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/01/6D3875/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/94/B835D4/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/A2/49CF7C/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/2C/B12641/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/AF/D1DC73/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/7B/5C0583/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/BC/22B544/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/62/2A22E9/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/3E/068711/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/F0/FE75B7/gp-reg-pat-prac-quin-age.csv",
+# "https://files.digital.nhs.uk/F0/EB38D4/gp-reg-pat-prac-quin-age.zip",
+# "https://files.digital.nhs.uk/1F/FA409A/gp-reg-pat-prac-quin-age.zip",
+# "https://files.digital.nhs.uk/5E/A3500C/gp-reg-pat-prac-quin-age.zip",
+# "https://files.digital.nhs.uk/63/9863C6/gp-reg-pat-prac-quin-age.zip",
+# "https://files.digital.nhs.uk/86/6550AA/gp-reg-pat-prac-quin-age.zip",
+# "https://files.digital.nhs.uk/28/5119C5/gp-reg-pat-prac-quin-age.zip",
+# "https://files.digital.nhs.uk/42/03B791/gp-reg-pat-prac-quin-age.zip",
+# "https://files.digital.nhs.uk/0B/6E9B60/gp-reg-pat-prac-quin-age.zip"
+# )
+# 
+# #naming all the files, according to the time point
+# file_names <- paste0("data/gp_population/time", sprintf("%02d", seq_along(urls)), ifelse(grepl(".zip$", urls), ".zip", ".csv"))
+# 
+# #Downloading the data
+# for (i in seq_along(urls)) {
+#   download.file(urls[i], destfile = file_names[i], mode = "wb")
+# }
+# 
+# #Some files are downloaded as zip files, so unzip these files and rename them.
+# zip_files <- list.files("data/gp_population", pattern = "\\.zip$", full.names = TRUE)
+# 
+# for (zip_path in zip_files) {
+#   base_name <- tools::file_path_sans_ext(basename(zip_path))
+#   tmp_dir <- file.path(tempdir(), base_name)
+#   dir.create(tmp_dir, showWarnings = FALSE)
+# 
+#   # Extract files
+#   unzip(zip_path, exdir = tmp_dir)
+# 
+#   # Find the first CSV in the extracted content
+#   csv_file <- list.files(tmp_dir, pattern = "\\.csv$", full.names = TRUE)
+# 
+#   if (length(csv_file) == 0) {
+#     message("No CSV found in ", zip_path)
+#     next
+#   }
+# 
+#   # Rename and move to the gp_population folder
+#   target_file <- file.path("data/gp_population", paste0(base_name, ".csv"))
+#   file.rename(csv_file[1], target_file)
+# }
+
+
+
+
+# Clean the data -----
+# Convert across all time points into wide format, and link all quarters together
+process_population_file <- function(file_path, time_index) {
+  read_csv(file_path, show_col_types = FALSE) %>%
+    clean_names() %>%
+    filter(org_type == "GP", sex != "ALL", age_group_5 != "ALL") %>%
+    group_by(org_code, age_group_5, sex) %>%
+    summarise(n = sum(number_of_patients), .groups = "drop") %>%
+    pivot_wider(names_from = sex, values_from = n, values_fill = 0) %>%
+    mutate(
+      count = MALE + FEMALE,
+      pct_boys = round(MALE / count * 100, 2),
+      age_group = str_replace_all(age_group_5, "\\s|\\+|-", "_")
+    ) %>%
+    pivot_wider(
+      id_cols = org_code,
+      names_from = age_group,
+      values_from = c(count, pct_boys),
+      names_glue = "{.value}_{age_group}"
+    ) %>%
+    rename(gpcode = org_code) %>%
+    mutate(time = time_index) %>% 
+    select(gpcode, time, `count_0_4`, `pct_boys_0_4`)
+}
+
+
+# Read and process all quarterly gp population files
+csv_files <- list.files("data/gp_population", pattern = "\\.csv$", full.names = TRUE) %>%
+  sort()  #ensure time order
+
+gp_pop_all <- map2_dfr(csv_files, seq_along(csv_files), process_population_file)
+
+
+#Link to the vaccine uptake ------
+gpmmr <- readRDS("data/GP_MMR_IMD_ICB.rds")
+
+gpmmr <- left_join(gpmmr, gp_pop_all, 
+                by = c("gpcode", "time"))
+
+
+saveRDS(gpmmr, file = "data/GP_MMR_IMD_ICB_POP.rds")
+
+# rm(list = ls())
+```
+
+## Fingertips Covariates
+
+GP-level indicators from the [Fingertips National General Practice Profiles](https://fingertips.phe.org.uk/profile/general-practice) were linked to the GP-level vaccine uptake dataset. These indicators were downloaded using the [`fingertipsR`](https://github.com/ropensci/fingertipsR) package in R. Data covering **6 covariates** were extracted:
+
+-   Clinical workforce per 10,000 (`workforce`)
+-   Average number of appointments per registered patient (`appointments`)
+-   Percentage of Quality Outcome Framework (QOF) achieved. (`qof`)
+-   Percentage of patients with caring responsibilities (`caring`)
+-   Percentage of patients satisfied with their GP (`satisfaction`)
+-   Total funding per patient (`funding`)
+
+Where possible, covariates were aggregated to match the quarterly structure of the vaccine uptake data. A copy of the extracted datasets is stored in `"data/fingertips_data/"`.
+
+```{r download-fingertips-data, eval=TRUE, cache=TRUE}
+
+# Script contain all custom functions 
+source("scripts/functions.R") # for the custom functions clean_fingertips_data()
+# Downloading data -----
+# Download and save indicators as CSVs from Fingertips
+# # Download and install fingertipsR in R
+# options(repos = c(
+#  ropensci = 'https://ropensci.r-universe.dev',
+#  CRAN = 'https://cloud.r-project.org'))
+# 
+# install.packages('fingertipsR')
+
+
+#These are the indicator we are interested at
+indicator_ids <- c(
+  295,    # QOF %
+  352,    # % with caring responsibility
+  93966,  # Clinical workforce per 10,000
+  93950,  # Total funding per patient
+  93438,  # GP satisfaction
+  93934   # Appointments per patient
+)
+
+indicator_names <- c(
+  "qof",
+  "caring",
+  "workforce",
+  "funding",
+  "satisfaction",
+  "appointments"
+)
+
+names(indicator_ids) <- indicator_names
+
+# save_dir <- "data/fingertips_data"
+# dir.create(save_dir, showWarnings = FALSE)
+# 
+# #download all and save them as a csv
+# for (id in indicator_ids){
+#   df <- fingertips_data(IndicatorID = id, AreaTypeID = 7)
+#   
+#   write.csv(df, file = file.path(save_dir, paste0("indicator_", id, ".csv")), row.names = FALSE)
+# }
+# 
+# rm(list = setdiff(ls(), c("indicator_ids","indicator_names")))
+
+
+#Loading all fingertips indicator data -------
+for (i in seq_along(indicator_ids)) {
+  id <- indicator_ids[i]
+  name <- names(indicator_ids)[i]
+  
+  path <- paste0("data/fingertips_data/indicator_", id, ".csv")
+  
+  assign(name, read_csv(path, show_col_types = FALSE) %>% clean_names())
+}
+
+#Loading vaccine uptake dataset
+gpmmr <- readRDS("data/GP_MMR_IMD_ICB_POP.rds")
+
+```
+
+### workforce
+
+```{r workforce, echo=TRUE, cache=TRUE}
+# Workforce ------
+workforce <- workforce %>%
+  janitor::clean_names() %>%
+  filter(area_type == "GPs") %>%
+  mutate(
+    timeperiod = str_trim(timeperiod),
+    # Aligning the time with the quarters in the uptake data, to join later on gpcode and time
+    time = case_when(
+      timeperiod == "2021 Q3" ~ 10,
+      timeperiod == "2021 Q4" ~ 11,
+      timeperiod == "2022 Q1" ~ 12,
+      timeperiod == "2022 Q2" ~ 13,
+      timeperiod == "2022 Q3" ~ 14,
+      timeperiod == "2022 Q4" ~ 15,
+      timeperiod == "2023 Q1" ~ 16,
+      timeperiod == "2023 Q2" ~ 17,
+      timeperiod == "2023 Q3" ~ 18,
+      timeperiod == "2023 Q4" ~ 19,
+      timeperiod == "2024 Q1" ~ 20,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  rename("gpcode" = "area_code", 
+         "workforce" = "value") %>% 
+  select(gpcode, workforce, time)
+
+#linking workforce to uptake --
+gpmmr <- left_join(gpmmr, workforce,    by = c("gpcode", "time"))
+```
+
+### Appointment per patient
+
+```{r appointments-per-patient, echo=TRUE, cache=TRUE}
+#Appointments per patient------
+
+appointments <- appointments %>%
+  janitor::clean_names() %>%
+  filter(area_type == "GPs") %>%
+  mutate(
+    date = parse_date_time(timeperiod, orders = "my"),
+    quarter = paste0(year(date), " Q", quarter(date))
+  ) #Adjusting the time to have proper date that I can link on.
+
+
+#Since the uptake data is reported every three month, we will average the monthly appointment data into quarters
+
+appointments <- appointments %>%
+  group_by(area_code, quarter) %>%
+  summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  rename(gpcode = area_code)
+
+fy_quarters <- tibble(
+  quarter = c("2022 Q4", "2023 Q1", "2023 Q2", "2023 Q3", "2023 Q4", "2024 Q1"),
+  time = 15:20 #this data starts from Oct 2022, which is time point 15 in the uptake data
+)
+
+appointments <- appointments %>%
+  left_join(fy_quarters, by = "quarter") %>%
+  select(gpcode, value, time) %>% rename("appoint_per_patient" = "value")
+
+
+# Linking appointments to uptake -- 
+gpmmr <- left_join(gpmmr, appointments, by = c("gpcode", "time"))
+```
+
+### Caring, funding, and QOF
+
+```{r caring-funding-qof, echo=TRUE, cache=TRUE}
+# Caring, satisfaction, funding, and qof -------
+
+indicator_names_to_process <- setdiff(indicator_names, c("appointments", "workforce"))
+
+adjusted_list <- map(
+  mget(indicator_names_to_process),
+  ~ .x %>% clean_fingertips_data()
+)
+
+list2env(adjusted_list, envir = .GlobalEnv)
+
+
+rm(list = setdiff(ls(), c(indicator_names, "gpmmr")))
+
+# Caring, satisfaction, funding, and qof are linked by year, as the are collected annually 
+
+# First adding an year variable into gp data 
+gpmmr <- gpmmr %>%
+  mutate(year = case_when(
+    time >= 1 & time <= 3 ~ 2019, #since time 1 in the data is April 2019, and data runs by quarters
+    time >= 4 & time <= 7 ~ 2020,
+    time >= 8 & time <= 11 ~ 2021,
+    time >= 12 & time <= 15 ~ 2022,
+    time >= 16 & time <= 19 ~ 2023,
+    time >= 20 ~ 2024, # We will consider jan_march_2025 as part of 2025, as no data is published yet for 2025
+    TRUE ~ NA_real_
+  ))
+
+# - linking caring, satisfaction, funding, and qof to uptake --
+gpmmr <- left_join(gpmmr, qof           %>% rename("qof" = "value"),       by = c("gpcode", "year"))
+gpmmr <- left_join(gpmmr, caring        %>% rename("caring" = "value"),    by = c("gpcode", "year"))
+gpmmr <- left_join(gpmmr, funding       %>% rename("funding" = "value"),   by = c("gpcode", "year"))
+gpmmr <- left_join(gpmmr, satisfaction  %>% rename("satisfied" = "value"), by = c("gpcode", "year"))
+
+saveRDS(gpmmr, file = "data/GP_MMR_IMD_ICB_POP_FING.rds")
+```
+
+## Ethnicity
+
+This section derives GP-level ethnicity estimates by linking two datasets:
+
+1.  2021 Census LSOA-level ethnicity data ([TS021 - Ethnic group](https://www.nomisweb.co.uk/datasets/c2021ts021)), downloaded from [Nomis](https://www.nomisweb.co.uk/.).
+2.  [April 2021 NHS GP patient registration data](https://digital.nhs.uk/data-and-information/publications/statistical/patients-registered-at-a-gp-practice/april-2021) by LSOA, which details how many patients from each LSOA are registered at each GP practice.
+
+These datasets were combined to calculate a weighted average ethnic composition (as a proportion). That is, for each GP, we calculate a weighted ethnicity percentage by multiplying each LSOA’s ethnic proportion by the number of patients from that LSOA registered at the GP. We then sum those values and divide by the total number of patients registered at the GP.
+
+
+A copy of the extracted datasets is stored in `"data/ethnicity/"`.
+$$
+\text{Weighted Percentage} = \frac{\sum (\text{LSOA Percentage} \times \text{LSOA Patient Count})}{\text{Total Patients at the GP}}
+$$
+
+We calculated weighted values for:
+
+-   **White**: English, Welsh, Scottish, Northern Irish or British
+-   **Asian**: Asian, Asian British or Asian Welsh
+-   **Black**: Black, Black British, Black Welsh, Caribbean or African
+-   **Mixed**: Mixed or Multiple ethnic groups
+-   **Other ethnicities**: Arab and any other ethnic group
+
+And also derived a total **non-White British percentage** (`pct_non_white_british`).
+
+```{r link-ethnicity, echo=TRUE, cache=TRUE}
+
+rm(list  = ls())
+
+# Load LSOA-level ethnicity data --
+ethn <- read_csv("data/ethnicity/LSOA_ethnicity.csv", skip = 7, skip_empty_rows = TRUE) %>% 
+  rename(
+    pct_asian  = "%...6",
+    pct_black  = "%...8",
+    pct_mixed  = "%...10",
+    pct_white  = "%...12",
+    pct_other  = "%...14",
+    lsoa       = "mnemonic") %>% 
+  mutate(
+    pct_non_white_british = 100 - pct_white  #derived variable
+  ) %>% 
+  select(
+    lsoa, pct_white, pct_asian, pct_black, pct_mixed, pct_other, pct_non_white_british
+  )
+
+
+
+# Load GP-LSOA population mapping ---
+
+# download.file("https://files.digital.nhs.uk/52/2D964D/gp-reg-pat-prac-lsoa-male-female-Apr-21.zip", 
+#               destfile = "data/ethnicity/gp_pop.zip")
+# 
+# unzip("data/ethnicity/gp_pop.zip", exdir = "data/ethnicity")
+
+# Each row gives the number of patients from a given LSOA registered to a GP.
+# This acts as the weighting factor.
+
+lsoa_pop <- read_csv("data/ethnicity/gp-reg-pat-prac-lsoa-all.csv") %>% 
+  select(
+    gpcode = PRACTICE_CODE,
+    lsoa   = LSOA_CODE,
+    pop    = `Number of Patients`)
+
+
+
+# Merge ethnicity proportions with LSOA patient counts and calculate GP-level weighted means ---------------------------
+
+ethnicity_gp_level <- left_join(lsoa_pop, ethn, by = "lsoa") %>%
+  mutate(across(starts_with("pct_"), ~ .x * pop, .names = "w_{.col}")) %>%
+  group_by(gpcode) %>%
+  summarise(
+    across(starts_with("w_pct_"), ~ sum(.x, na.rm = TRUE), .names = "{str_remove(.col, 'w_')}"),
+    total_pop = sum(pop, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(across(starts_with("pct_"), ~ .x / total_pop)) %>%
+  select(-total_pop)
+
+
+# The resulting dataset contains the estimated ethnic composition of each GP practice 
+# based on weighted LSOA contributions.
+
+
+# Merging with vaccine uptake dataset ----- 
+
+gpmmr <- readRDS("data/GP_MMR_IMD_ICB_POP_FING.rds")
+
+gpmmr <- left_join(gpmmr, ethnicity_gp_level, by = "gpcode")
+
+saveRDS(gpmmr, file = "data/GP_MMR_IMD_ICB_POP_FING_ETHN.rds")
+
+# rm(list = ls())
+```
+
+## Distance from GP
+
+The geographic accessibility of practice was proxied using the average straight-line distance between each GP practice and the Lower Super Output Areas (LSOAs) where its registered population lives. As GPs serve patients from multiple LSOAs, Euclidean distance was first calculated between each practice physical location and the population weighted centroid of each LSOA from which practice had registered patients, then these values were averaged using LSOA-patient counts as weights to obtain a single measure for each GP. 
+
+All datasets needed are included within the projects folders and explain within the below script.
+```{r gp-distance, cache=TRUE}
+
+rm(list = ls())
+
+
+# ================================================================
+# Load required datasets
+# ================================================================
+
+# GP list and practice postcodes
+# ----------------------------------
+
+# This file contains GP practice codes, names, and postcodes.
+# The postcode will later be linked to its geographical centroid (NSPL data).
+pc_gp <- read_csv("data/interv_gp/epraccur.csv", col_names = FALSE) %>% 
+  rename(
+    gpcode = X1,   # GP practice code
+    gpname = X2,   # GP practice name
+    pc     = X10   # practice postcode
+  )
+
+# Postcode to LSOA lookup table 
+# ----------------------------------------------------------
+# Links each postcode to its 2011 LSOA code.
+pc_lsoa <- read_csv("data/interv_gp/PCD_OA_LSOA_MSOA_LAD_NOV22_UK_LU.csv") %>% 
+  select(pc = pcds, lsoa11 = lsoa11cd)
+
+
+# GP-LSOA registered population (patient counts)
+# --------------------------------------------------
+# This dataset gives, for each GP and LSOA combination, the number of patients
+# registered at that GP who live in the LSOA. These counts will be used as
+# weights when computing average distances later on.
+
+gp_pop <- read_csv(
+  "data/interv_gp/gp-reg-pat-prac-lsoa-male-female-July-2022/gp-reg-pat-prac-lsoa-all.csv",
+  show_col_types = FALSE
+) %>% 
+  rename(
+    gpcode = PRACTICE_CODE,    # GP practice code
+    gpname = PRACTICE_NAME,    # GP practice name
+    lsoa21 = LSOA_CODE,        # 2021 LSOA code
+    pop    = `NUMBER_OF_PATIENTS` # number of patients in that LSOA–GP pairing
+  )
+
+# ================================================================
+# Load spatial datasets 
+# ================================================================
+
+# NSPL postcode centroids
+# ---------------------------
+# Each postcode in the UK has a corresponding centroid location.
+# This shapefile provides coordinates for all postcodes (points).
+nspl <- read_sf("data/interv_gp/NSPL_Online_Latest_Centroids/NSPL_Online_Latest_Centroids.shp") %>%
+  select(pc = PCDS, geometry)
+
+# LSOA population-weighted centroids
+# --------------------------------------
+# Each LSOA has a "population-weighted centroid" representing the average
+# residential location of its residents. These will serve as patient locations.
+lsoa_centroids <- read_sf("data/interv_gp/LSOA_PopCentroids_EW_2021_V4_-8229881830311519574/LSOA_PopCentroids_EW_2021_V4.shp") %>%
+  rename(lsoa21 = LSOA21CD) %>%
+  select(lsoa21, geometry)
+
+# Create a plain (non-sf) version that stores the centroid geometry as a list-column.
+lsoa_centroids_df <- lsoa_centroids %>%
+  mutate(geometry_lsoa = geometry) %>%
+  st_drop_geometry()
+
+# ================================================================
+# create GP point geometries
+# ================================================================
+
+# Join GP postcodes with their centroid coordinates from NSPL,
+# keeping only those with available geometry.
+gp_locations <- pc_gp %>%
+  left_join(nspl, by = "pc") %>%
+  filter(!is.na(geometry)) %>%
+  st_as_sf()  # convert to sf object so we can treat it as spatial
+
+# Store geometry as a list-column for later rowwise distance calculation
+gp_locations_df <- gp_locations %>%
+  mutate(geometry_gp = geometry) %>%
+  st_drop_geometry()
+
+# ================================================================
+# set a common CRS
+# ================================================================
+
+# Both GP and lsoa layers must use the same projected CRS to calculate the distances.
+# EPSG:27700 = British National Grid 
+gp_locations   <- st_transform(gp_locations, 27700)
+lsoa_centroids <- st_transform(lsoa_centroids, 27700)
+
+# ================================================================
+# Clean population table
+# ================================================================
+
+# Keep only valid GP–LSOA pairs where both geometry and codes exist.
+gp_pop_clean <- gp_pop %>%
+  filter(!is.na(gpcode), !is.na(lsoa21)) %>%
+  semi_join(st_drop_geometry(gp_locations),   by = "gpcode") %>%
+  semi_join(st_drop_geometry(lsoa_centroids), by = "lsoa21")
+
+# ================================================================
+# Attach geometries to each GP-LSOA pair
+# ================================================================
+
+# Merge GP and LSOA coordinates into one table (one row per GP–LSOA pair).
+# Each row now contains:
+#   - gpcode, lsoa21
+#   - number of patients in that LSOA (pop)
+#   - geometry_gp: GP practice location
+#   - geometry_lsoa: LSOA centroid location
+gp_lsoa <- gp_pop_clean %>%
+  left_join(gp_locations_df,   by = "gpcode") %>%
+  left_join(lsoa_centroids_df, by = "lsoa21")
+
+# ================================================================
+# compute a straighline distances (in km)
+# ================================================================
+
+# Calculate Euclidean distance between each lsoa centroid and its GP location.
+# st_distance() gives meters; divide by 1000 to get kilometers.
+gp_lsoa <- gp_lsoa %>%
+  mutate(distance_km = map2_dbl(
+    geometry_gp, geometry_lsoa,
+    ~ as.numeric(st_distance(.x, .y)) / 1000))
+
+
+# ================================================================
+# compute patient-weighted average distance per GP
+# ================================================================
+
+# For each GP, we calculate the weighted mean distance using the number of patients
+# per LSOA as weights.
+gp_accessibility <- gp_lsoa %>%
+  group_by(gpcode) %>%
+  summarise(
+    weighted_distance_km = weighted.mean(distance_km, w = pop, na.rm = TRUE),
+    total_patients       = sum(pop, na.rm = TRUE),
+    n_lsoas              = n()
+  ) %>%
+  ungroup()
+
+# This table now contains one row per GP with its patient-weighted
+
+# ================================================================
+# join the geo accessibility metric to your main dataset
+# ================================================================
+
+# Load the main analysis dataset (previously saved with deprivation, ICB, etc.)
+gp_all <- readRDS("data/GP_MMR_IMD_ICB_POP_FING_ETHN.rds")
+
+# Merge the new accessibility metric into your main GP-level dataset.
+gpmmr_final <- gp_all %>%
+  left_join(gp_accessibility, by = "gpcode")
+
+
+saveRDS(gpmmr_final, "data/GP_MMR_IMD_ICB_POP_FING_ETHN_dist.rds")
+  
+```
+
+# Synthetic control analysis
+
+## Overview
+
+This section evaluates the impact of the intervention on vaccine uptake using synthetic control methods, implement through the `Microsynth` package in R. We modelled outcomes as counts of vaccinated children, across six childhood vaccines (MMR1 at 24 months, MMR1 at 5 years, and MMR2 at 5 years, DTaP/IPV/Hib/HepB (6-in-1) at 12 months, Rotavirus at 12 months, and PCV Booster at 2 years). The analysis is structured as follows:
+
+1.  Data preparation
+
+2.  Summary Statistics:
+
+3.  Running the synthetic control models:
+
+    \- 1 km buffer distance
+
+    \- 1.5 km buffer distance
+
+    \- 0.5 km buffer distance
+
+## Data preparation
+
+### Temporal Variation in Covariates
+
+To determine whether GP-level covariates vary meaningfully over time, we calculated the coefficient of variation (CV) for each covariate across time points, within each GP. The CV is calculated by dividing the the standard deviation by the mean, and provides a relative measure of variability regardless of scale. In simple terms, it explains how much a variable varies relative its mean.
+
+```{r coefficient-varriation, echo=TRUE}
+
+rm(list = ls())
+# loading uptake data with all covariates linked
+gp_all <- readRDS("data/GP_MMR_IMD_ICB_POP_FING_ETHN_dist.rds")
+# gp_all <- gp_all %>% select(-workforce.y) %>% rename(workforce = workforce.x)
+gp <- gp_all %>% 
+  select(gpcode, time, den_12m, den_24m, den_5y, mmr1_24m, mmr1_5y, 
+         mmr2_5y, `6_in_1`, rota, pcv_boost, rota, pcv_boost, imd_2025,
+         imd_decile, count_0_4, pct_boys_0_4, workforce, appoint_per_patient,
+         year, qof, caring, funding, satisfied, pct_white, pct_asian, pct_black, 
+         pct_mixed, pct_other, pct_non_white_british, distance=weighted_distance_km,  pcn_name) 
+
+
+
+# This step helps assess whether it is reasonable to represent each covariate by its time-averaged value (i.e., time-invariant)
+
+gp_covars <- gp %>%
+  group_by(gpcode) %>%
+  summarise(
+    `Registered population aged 0-4` = sd(count_0_4, na.rm = TRUE) / mean(count_0_4, na.rm = TRUE) * 100,
+    `Proportion of boys aged 0-4`    = sd(pct_boys_0_4, na.rm = TRUE) / mean(pct_boys_0_4, na.rm = TRUE) * 100,
+    `Appointments per patient`       = sd(appoint_per_patient, na.rm = TRUE) / mean(appoint_per_patient, na.rm = TRUE) * 100,
+    `Patient satisfaction` = sd(satisfied, na.rm = TRUE) / mean(satisfied, na.rm = TRUE) * 100, 
+    `Quality and Outcomes Framework (QOF) score`  = sd(qof, na.rm = TRUE) / mean(qof, na.rm = TRUE) * 100,
+    `Patients with caring responsibilities`       = sd(caring, na.rm = TRUE) / mean(caring, na.rm = TRUE) * 100
+        # cv_workforce = sd(workforce, na.rm = TRUE) / mean(workforce, na.rm = TRUE) * 100,
+    # cv_den_12m = sd(den_12m, na.rm = TRUE) / mean(den_12m, na.rm = TRUE) * 100 , 
+    # cv_den_24m = sd(den_24m, na.rm = TRUE) / mean(den_24m, na.rm = TRUE) * 100 ,
+    # cv_funding   = sd(funding, na.rm = TRUE) / mean(funding, na.rm = TRUE) * 100,
+    # cv_den_5y = sd(den_5y, na.rm = TRUE) / mean(den_5y, na.rm = TRUE) * 100
+    )
+
+
+# visualisation of the cv
+gp_covars %>%
+  pivot_longer(cols = c(2:7), names_to = "variable", values_to = "cv") %>%
+  ggplot(aes(x = cv)) +
+  geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+  facet_wrap(~ variable, scales = "free") +
+  scale_x_continuous(limits = c(1, 100), expand = c(0,0)) +
+  theme_minimal() +
+  labs( x = "Coefficient of Variation", y = "Number of general practices")
+
+ggsave(plot = last_plot(), filename = "outputs/temporal_variation.pdf", width = 15, height = 10)
+```
+
+```{r tab-coefficient-varriation, echo=TRUE, eval=FALSE}
+# Summarise the distribution of cvs for each covariate using mean and median
+ gp_covars %>%
+  pivot_longer(cols = starts_with("cv_"), names_to = "variable", values_to = "cv") %>%
+  group_by(variable) %>%
+  summarise(
+    `Mean coefficient of variation`= round(mean(cv, na.rm = TRUE), digits = 2),
+    `Median coefficient of variation` = round(median(cv, na.rm = TRUE), digits = 2),
+    .groups = "drop"
+  ) %>% gt() %>% 
+  gt::tab_caption("Coefficient of variation for GP covariates")
+
+cv_dens <- glue("{round(mean(gp_covars$cv_den_12m, na.rm = T), 2)} for den_12m, {round(mean(gp_covars$cv_den_24m, na.rm = T), 2)} for den_24m, and {round(mean(gp_covars$cv_den_5y, na.rm = T), 2)} for den_5y")
+
+# All covariates demonstrated a coefficient of variation (CV) below 15% (Table \@ref(tab:tab-coefficient-varriation)), with the exception of `caring`, which had a CV of `r round(mean(gp_covars$`Patients with caring responsibilities`, na.rm = T), 2)`%. Given their low variability over time, all covariates were treated as time-invariant by applying their overall mean as a single estimate across all quarters.
+# 
+# Meanwhile, the denominators (`den_12m`, `den_24m`, and `den_5y`) will be included as an outcome matching variable, rather than using them as a time-invariant covariate. This approach was chosen because the denominators exhibited high variability over time (a coefficient of variation of `r cv_dens`), making them unsuitable for averaging to a single point estimate. 
+```
+
+```{r converting-cov-time-invariant, echo=TRUE}
+# All covariates will be considered as time invariant 
+gp_avg_covars <- gp %>% 
+  group_by(gpcode) %>%
+  summarise(
+    count_0_4 = as.integer(mean(count_0_4, na.rm = TRUE)),
+    pct_boys_0_4 = mean(pct_boys_0_4, na.rm = TRUE), 
+    workforce = mean(workforce, na.rm = TRUE), 
+    appoint_per_patient = mean(appoint_per_patient, na.rm = TRUE), 
+    qof = mean(qof, na.rm = TRUE), 
+    caring = mean(caring, na.rm = TRUE), 
+    funding = mean(funding, na.rm = TRUE), 
+    satisfied = mean(satisfied, na.rm = TRUE)
+  )
+
+
+gp <- gp %>%
+  select(-c(count_0_4, pct_boys_0_4, workforce, appoint_per_patient, qof, caring, funding, satisfied)) %>%
+  left_join(gp_avg_covars, by = "gpcode")
+
+rm(list = setdiff(ls(), c("gp", "gp_all")))
+```
+
+Lastly, missing data for included covariates (`r glue("{pct_miss_case(gp) %>% round(2)}% [n= {n_case_miss(gp) %>% comma()}]")`) were dropped.
+
+```{r dropping-covariates-missings-flow-chart, echo=TRUE, cache=TRUE}
+naniar::miss_var_summary(gp) %>% gt
+
+total_uniq_gp_missing <- gp %>%
+  filter(if_any((everything()), ~ is.na(.x))) %>% distinct(gpcode) %>% nrow()
+
+text_ex_missing <- paste0(
+  total_uniq_gp_missing, " Excluded GPs (",
+  nrow(gp_all) - nrow(gp %>% na.omit()), " rows) with incomplete matching covariates data\n",
+  "     ",
+  gp %>% filter(is.na(funding)) %>% distinct(gpcode) %>% nrow(),
+  " missing funding status\n",
+  "     ",
+  gp %>% filter(is.na(workforce)) %>% distinct(gpcode) %>% nrow(),
+  " missing workforce data\n",
+  "     ",
+  gp %>% filter(is.na(appoint_per_patient)) %>% distinct(gpcode) %>% nrow(),
+  " missing data on the average number of appointments per patient\n",
+  "     ",
+  gp %>% filter(is.na(qof)) %>% distinct(gpcode) %>% nrow(),
+  " missing Quality and Outcomes Framework (QOF) records\n",
+  "     ",
+  gp %>% filter(is.na(caring)) %>% distinct(gpcode) %>% nrow(),
+  " missing data on patients with caring responsibilities\n",
+  "     ",
+  gp %>% filter(is.na(satisfied)) %>% distinct(gpcode) %>% nrow(),
+  " missing patient satisfaction data\n",
+  "     ",
+  gp %>% filter(is.na(distance)) %>% distinct(gpcode) %>% nrow(),
+  " missing geographical accessibility measure\n"
+)
+
+gp <- na.omit(gp)
+
+
+#Adjusting the flow diagram
+total_uniq_gps <- gp %>% select(gpcode) %>% n_distinct()
+
+# saveRDS(flow_chart, file = "outputs/flow_chart4.rds" )
+```
+
+### Defining Intervention practices
+
+Although the HELP interventions were informed by data extracted from 10 practices, the interventions themselves were implemented in community settings. Therefore, we classified practices as part of the intervention group based on their proximity to intervention sites. To account for the fact that practices often register patients living in various parts of the city (i.e., not necessarily near the GP’s physical location), we used their population-weighted centroid. Specifically, we:
+
+1.  Calculated weighted centroids for each GP practice based on the distribution of its registered patients across Liverpool’s LSOAs.
+2.  Defined intervention sites from their postcode using the [National Statistics Postcode Lookup dataset](https://geoportal.statistics.gov.uk/search?q=PRD_NSPL%20AUG_2025&sort=Date%20Created%7Ccreated%7Cdesc).
+3.  Created a buffer zone around each intervention site.
+4.  Assigned practices to the intervention group if their weighted centroid fell within the buffer zones (certain distance from the intervention sites).
+
+Practices outside these zones formed the donor pool for constructing the synthetic control group.
+
+```{r intervention-practices, cache=TRUE}
+
+# Parameters
+target_crs <- 27700  # British national grid (meters)
+
+##  Load lookups and filter to Liverpool LSOAs ----
+## LSOA 2011 to LSOA 2021 lookup. 
+lsoa_lookup <- read_csv(
+  "data/interv_gp/LSOA_(2011)_to_LSOA_(2021)_to_Local_Authority_District_(2022)_Best_Fit_Lookup_for_EW_(V2) (1).csv") %>%
+  filter(LAD22NM == "Liverpool") %>%     # filtering to keep only Liverpool
+  rename(lsoa11 = LSOA11CD, lsoa21 = LSOA21CD)
+
+## loading LSOA 2021 shapfile 
+lsoa_sf <- read_sf(
+  "data/interv_gp/Lower_layer_Super_Output_Areas_(December_2021)_Boundaries_EW_BFC_(V10)/Lower_layer_Super_Output_Areas_(December_2021)_Boundaries_EW_BFC_(V10).shp"
+) %>%
+  rename(lsoa21 = LSOA21CD) %>%
+  filter(lsoa21 %in% lsoa_lookup$lsoa21) %>%
+  st_transform(target_crs) %>% # project to meters
+  left_join(lsoa_lookup, by = "lsoa21")
+
+# derive the centroid for each LSOA. 
+lsoa_pts <- lsoa_sf %>%
+  st_centroid() %>%            
+  select(lsoa21, lsoa11)                        
+
+# Extract the coordinates 
+lsoa_xy <- st_coordinates(lsoa_pts)    
+lsoa_pts <- lsoa_pts %>%
+  mutate(X = lsoa_xy[, "X"], Y = lsoa_xy[, "Y"])
+
+# Filtering practices that are physically located in a Liverpool LSOA11 to avoid having non-Liverpool practices contributing to the weighted centroids. 
+# To do so, we use 2 look-up tables: 1) A GP to PC table and 2) a PC to LSOA one
+
+## loading GP to postcode look-up table
+pc_gp <- read_csv("data/interv_gp/epraccur.csv", col_names = F) %>%
+  rename(gpcode = X1, gpname = X2, pc = X10)
+
+## loading postcode to LSOA lookup table
+pc_lsoa <- read_csv("data/interv_gp/PCD_OA_LSOA_MSOA_LAD_NOV22_UK_LU.csv") %>%
+  select(pc = pcds, lsoa11 = lsoa11cd) %>% 
+  left_join(lsoa_lookup, by = "lsoa11")
+
+## filtering to keep only practices in Liverpool
+gp_in_liverpool <- pc_gp %>%
+  left_join(pc_lsoa, by = "pc") %>%
+  filter(lsoa11 %in% lsoa_lookup$lsoa11) %>%    # practice location in Liverpool
+  distinct(gpcode)
+
+# Calculated the patients weighted centroids for the GPs based on their respective registered population
+
+## Loading the GP-registered population for July 2022 (intervention starting period)
+
+gp_pop <- read_csv(
+  "data/interv_gp/gp-reg-pat-prac-lsoa-male-female-July-2022/gp-reg-pat-prac-lsoa-all.csv",
+  show_col_types = FALSE) %>%
+  rename(
+    gpcode = PRACTICE_CODE,
+    gpname = PRACTICE_NAME,
+    lsoa21 = LSOA_CODE,
+    pop    = `NUMBER_OF_PATIENTS`) %>% filter(gpcode %in% gp_in_liverpool$gpcode) %>% 
+  left_join(lsoa_lookup, by = "lsoa21") %>%
+  mutate(lsoa21 = coalesce(lsoa21, lsoa11)) %>%
+  select(gpcode, gpname, lsoa21, pop)
+
+
+
+## joining lsoa points (x, y) to GP-LSOA weights
+gp_weights_xy <- gp_pop %>%
+  left_join(lsoa_pts %>% st_drop_geometry() %>% select(lsoa21, X, Y), by = "lsoa21") %>%
+  filter(!is.na(X), !is.na(Y))
+
+# Weighted x and y per GP:
+gp_weighted_xy <- gp_weights_xy %>%
+  group_by(gpcode, gpname) %>%
+  summarise(
+    wsum = sum(pop, na.rm = TRUE),
+    xbar = sum(pop * X, na.rm = TRUE) / wsum,
+    ybar = sum(pop * Y, na.rm = TRUE) / wsum,
+    .groups = "drop"
+  ) %>%
+  # create sf point for each GP weighted centroid
+  st_as_sf(coords = c("xbar", "ybar"), crs = target_crs)
+
+# Defining the intervention sites using the national statistics postcode lookup table
+nspl <- read_sf("data/interv_gp//NSPL_Online_Latest_Centroids/NSPL_Online_Latest_Centroids.shp") %>%
+  filter(CTY == "E11000002") %>%     # Liverpool
+  st_transform(target_crs)
+
+intervention_site_postcodes <- c("L6 1AE", "L8 2UU", "L5 2PY", "L8 1TH",
+                                 "L8 0TP", "L7 8TQ", "L7 6HD", "L15 0EE", "L11 2RY")
+
+intervention_sites <- nspl %>%
+  filter(PCDS %in% intervention_site_postcodes)
+
+
+# Setting a buffer zone around the intervention site, and assigning intervention status
+radius_km <- c(0.5, 1, 1.5)
+
+# A function that returns the intervention GPs for a given radius
+get_intervention_gps <- function(r_km) {
+  sites_buff <- st_buffer(intervention_sites, dist = r_km * 1000) %>%
+    mutate(radius_km = r_km)
+
+  gp_flag <- gp_weighted_xy %>%
+    mutate(in_buffer = lengths(st_intersects(., sites_buff)) > 0) %>%
+    transmute(radius_km = r_km, gpcode, gpname, in_buffer)
+
+  list(
+    gp_flag = gp_flag,
+    sites_buff = sites_buff
+  )
+}
+
+# apply over all radii and bind results
+all_results  <- map(radius_km, get_intervention_gps)
+
+intervention_gps <- map_dfr(all_results, "gp_flag")
+sites_buff <- map_dfr(all_results, "sites_buff")
+
+
+# #Use the following to save the intervention GPs (depending on the buffer distance used)
+saveRDS(intervention_gps %>% st_drop_geometry() %>% filter(in_buffer == T & radius_km == 0.5) %>% select(gpcode) %>% pull()
+, "data/interv_gp/0.5km_interv.rds")
+
+saveRDS(intervention_gps %>% st_drop_geometry() %>% filter(in_buffer == T & radius_km == 1) %>% select(gpcode) %>% pull()
+        , "data/interv_gp/1km_interv.rds")
+
+
+saveRDS(intervention_gps %>% st_drop_geometry() %>% filter(in_buffer == T & radius_km == 1.5) %>% select(gpcode) %>% pull()
+        , "data/interv_gp/1.5km_interv.rds")
+
+```
+
+The table (Table: \@ref(tab:tab-buffer)) and map (Figure: \@ref(fig:fig-buffer)) shows the definition of the ***"intervention GPS"*** using three different radii from the intervention site (0.5, 1, and 1.5 km). For the main analysis, 1.5 km buffer distance will be used.
+
+```{r tab-buffer, cache=TRUE}
+# check how many gps
+intervention_gps %>% filter(in_buffer == T) %>% st_drop_geometry() %>%
+  count(radius_km, name = "n_gps_in_buffer") %>% gt() %>% 
+  tab_caption("Number of intervention GPs within each buffer radius")
+```
+
+```{r fig-buffer, cache=TRUE,fig.cap = "Intervention buffer areas (0.5 km, 1 km, and 1.5 km)"}
+
+# Map
+m1 <- ggplot() +
+  # base lsoa polygons
+  geom_sf(data = lsoa_sf, fill = "grey98", linewidth = 0.1) +
+  
+  # intervention buffer areas
+  geom_sf(data = sites_buff %>% filter(radius_km == 0.5), aes(fill = "Intervention buffer"), alpha = 0.25, color = "#E1B12C") +
+  
+  # intervention site points
+  geom_sf(data = intervention_sites, aes(color = "Intervention site"), size = 2) +
+  
+  # weighted gp centroids 
+  geom_sf(
+    data = intervention_gps %>% filter(in_buffer == T & radius_km == 0.5),
+    aes(color = "GP in buffer"),
+    alpha = 0.9, size = 1.8) +
+  
+  
+  coord_sf(expand = FALSE) +
+  labs(
+    title = paste0(radius_km[1], " km intervention buffers"),
+    fill  = "", color = "")  + 
+  scale_fill_manual(
+    values = c("Intervention buffer" = "#E1B12C"), guide = guide_legend(
+      override.aes = list(shape = 21))) +
+  scale_color_manual( values = c(
+      "Intervention site" = "#2ECC71",
+      "GP in buffer"      = "red")) +
+  theme_void(base_size = 18) +
+  theme(legend.position = "bottom")
+
+
+
+m2 <- ggplot() +
+  # base lsoa polygons
+  geom_sf(data = lsoa_sf, fill = "grey98", linewidth = 0.1) +
+  
+  # intervention buffer areas
+  geom_sf(data = sites_buff %>% filter(radius_km == 1), aes(fill = "Intervention buffer"), alpha = 0.25, color = "#E1B12C") +
+  
+  # intervention site points
+  geom_sf(data = intervention_sites, aes(color = "Intervention site"), size = 2) +
+  
+  # weighted gp centroids 
+  geom_sf(
+    data = intervention_gps %>% filter(in_buffer == T & radius_km == 1),
+    aes(color = "GP in buffer"),
+    alpha = 0.9, size = 1.8) +
+  
+  coord_sf(expand = FALSE) +
+  labs(
+    title = paste0(radius_km[2], " km intervention buffers"),
+    fill  = "", color = "")  + 
+  scale_fill_manual(
+    values = c("Intervention buffer" = "#E1B12C"), guide = guide_legend(
+      override.aes = list(shape = 21))) +
+  scale_color_manual( values = c(
+      "Intervention site" = "#2ECC71",
+      "GP in buffer"      = "red")) +
+  theme_void(base_size = 18) +
+  theme(legend.position = "bottom")
+
+
+m3 <- ggplot() +
+  # base lsoa polygons
+  geom_sf(data = lsoa_sf, fill = "grey98", linewidth = 0.1) +
+  
+  # intervention buffer areas
+  geom_sf(data = sites_buff %>% filter(radius_km == 1.5), aes(fill = "Intervention buffer"), alpha = 0.25, color = "#E1B12C") +
+  
+  # intervention site points
+  geom_sf(data = intervention_sites, aes(color = "Intervention site"), size = 2) +
+  
+  # weighted gp centroids (invtervention gps)
+  geom_sf(
+    data = intervention_gps %>% filter(in_buffer == T & radius_km == 1.5),
+    aes(color = "GP in buffer"),
+    alpha = 0.9, size = 1.8) +
+  
+  coord_sf(expand = FALSE) +
+  labs(
+    title = paste0(radius_km[3], " km intervention buffers"),
+    fill  = "", color = "")  + 
+  scale_fill_manual(
+    values = c("Intervention buffer" = "#E1B12C"), guide = guide_legend(
+      override.aes = list(shape = 21))) +
+  scale_color_manual( values = c(
+      "Intervention site" = "#2ECC71",
+      "GP in buffer"      = "red")) +
+  theme_void(base_size = 18) +
+  theme(legend.position = "bottom")
+
+m1 + m2 + m3 + plot_layout(ncol = 3, guides = "collect") & theme(legend.position = "bottom")
+
+
+ggsave(plot = last_plot(),  filename = "outputs/buffer_distances.pdf",
+  width = 16, 
+  height = 10,
+  units = "in",
+  dpi = 800)
+
+rm(list = setdiff(ls(), c("gp", "gp_all", "text_ex_missing", "total_uniq_gp_missing", "total_uniq_gps")))
+```
+
+### Defining treated units for the SCM
+
+Microsynth defines treatment status using a binary `interv` variable:
+
+-   All units (treated and controls) are assigned 0 during the preintervention period.
+-   Only treated units are assigned 1 during the postintervention period.
+
+```{r defining-scm-paramters, echo=TRUE, cache=TRUE}
+interv_1km <- readRDS("data/interv_gp/1km_interv.rds")
+
+# Create intervention variable 
+# For plotting purposes, we set `interv = 1` for all intervention GPs regardless of time. This simplifies the calculation and display of uncertainty measure. For Microsynth models, we redefine interv using `end.pre` to align with Microsynth definetion where treated units are only coded as 1 in the postintervention period.
+
+gp <- gp %>% 
+  mutate(interv = case_when(
+    gpcode %in% interv_1km ~ 1,  
+    TRUE ~ 0))
+
+gp %>% distinct(gpcode) %>% nrow()
+#Flow chart final
+flow_chart <- readRDS("data/flowchart/flow_chart1.rds")
+
+final_chart <- flow_chart %>% 
+  fc_filter(
+    N = nrow(gp),
+    text_pattern = paste0("{label}\n {n} rows ({perc}%)"),
+    label = paste0("Final analytic sample", "\n (", gp %>% distinct(gpcode) %>% nrow() , " GP)"),
+    show_exc = TRUE,
+    text_fs = 10,
+    text_fs_exc = 8,
+    perc_total = TRUE
+  ) %>% 
+  fc_split(
+    N = c(
+      gp %>% filter(interv == 1) %>% nrow(),
+      gp %>% filter(interv == 0) %>% nrow()
+    ), 
+    perc_total = TRUE,
+    text_pattern = paste0("{label}\n {n} rows ({perc}%)"), 
+    label = c(
+      paste0("Intervention Group\n(", gp %>% filter(interv == 1) %>% distinct(gpcode) %>% nrow(), " GP)"),
+      paste0("Control Group\n(", gp %>% filter(interv == 0) %>% distinct(gpcode) %>% nrow(), " GP)")
+    )
+  ) %>% 
+  fc_modify(
+    ~ .x %>%
+      mutate(
+        text = ifelse(id == 7, text_ex_missing, text),
+        just = ifelse(id %in% c(3,5,7), "left", "center"),
+        x = ifelse(id == 7, x + 0.15, x),
+        y = ifelse(id == 6, y - 0.05, y)  
+      )
+  )
+
+
+
+# Export 
+pdf("outputs/Figure1_flow_chart_final.pdf",
+    width = 14, height = 9)
+
+fc_draw(final_chart, big.mark = ",")
+
+dev.off()
+
+fc_draw(final_chart, big.mark = ",")
+```
+
+### Calculating the uptake count
+
+We calculated the nominator (i.e., count of vaccinated children each quarter) to be used as the outcome. The count variable was given the suffix `i_` followed by the vaccine name.
+
+$$
+\text{Nominator} = \frac{\text{Percentage Uptake}  \times  \text{Eligible Population}} {100}
+$$
+
+```{r, cache=TRUE}
+# Calculating the nominator (uptake count) to be used as an outcome
+gp <- gp %>% rename(six_in_one = `6_in_1`) # renaming 6_in_1 vaccine as it caused problem when use in this format
+
+gp <- gp %>% 
+  mutate(
+    i_rota = round((rota* `den_12m`)/ 100),
+    i_six_in_one = round((six_in_one * `den_12m`)/100),
+    
+    i_mmr1_24m = round((mmr1_24m * `den_24m`)/100), 
+    i_pcv_boost = round((pcv_boost * `den_24m`)/100),
+    
+    i_mmr1_5y = round((mmr1_5y * `den_5y`)/100), 
+    i_mmr2_5y = round((mmr2_5y * `den_5y`)/100)
+  )
+```
+
+### Correlation between covariates
+
+Before running the SCM models, we plotted a correlation matrix (Figure \@ref(fig:fig-corr-plot)) to explore the relationships among covariates and their correlation with vaccine uptake. As expected, vaccines administered at the same age showed strong positive correlations. For example:
+
+-   Rotavirus vaccine and the 6-in-1 vaccine at 12 month: `r cor(gp[["rota"]], gp[["six_in_one"]]) %>% round(2)`
+-   MMR1 and PCV Boost at 2 years: `r cor(gp$mmr1_24m, gp$pcv_boost) %>% round(2)`
+-   MMR1 at 5 years and MMR2 at 5 years: `r cor(gp$mmr1_5y, gp$mmr2_5y) %>% round(2)`
+
+While count_0_4 denominators demonstrated a high positive correlation with the denominators, the latter provides a more direct measure of the eligible population and thus was preferred for matching.
+
+```{r fig-corr-plot, fig.cap = "Correlation Matrix for the outcomes and matching covariates", echo=TRUE, cache=TRUE}
+# Correlation matrix. 
+
+# Adjusting variable names
+pretty_names <- c(
+  interv             = "Intervention group (1 = Yes)",
+  den_12m            = "Eligible population (12 months)",
+  den_24m            = "Eligible population (24 months)",
+  den_5y             = "Eligible population (5 years)",
+  i_mmr1_24m         = "MMR1 doses (24 months)",
+  i_mmr1_5y          = "MMR1 doses (5 years)",
+  i_mmr2_5y          = "MMR2 doses (5 years)",
+  i_rota             = "Rotavirus doses (12 months)",
+  i_pcv_boost        = "PCV booster doses (24 months)",
+  i_six_in_one       = "6-in-1 doses (12 months)",
+  imd_2025           = "Deprivation score (IMD 2025)",
+  pct_white          = "% White British",
+  pct_black          = "% Black/Black British",
+  pct_asian          = "% Asian/Asian British",
+  pct_mixed          = "% Mixed ethnicity",
+  pct_other          = "% Other ethnicity",
+  count_0_4          = "Population aged 0–4 years",
+  pct_boys_0_4       = "% Boys aged 0–4 years",
+  workforce          = "Workforce size",
+  appoint_per_patient= "Appointments per patient",
+  qof                = "QOF performance score",
+  caring             = "% Patients with caring responsibilities",
+  funding            = "Funding per patient (£)",
+  satisfied          = "% Patient satisfaction",
+  distance           = "Average patient–GP distance (km)"
+)
+
+
+# Generating the correlation matrix
+gp_cor <- gp %>%
+  select(interv, den_12m, den_24m, den_5y, 
+         i_mmr1_24m, i_mmr1_5y, i_mmr2_5y, i_rota, 
+         i_pcv_boost, i_six_in_one, imd_2025, pct_white, 
+         pct_black, pct_asian, pct_mixed, pct_other, 
+         count_0_4, pct_boys_0_4, workforce, appoint_per_patient, 
+         qof, caring, funding, distance, satisfied) %>%
+  rename_with(~ pretty_names[.x])
+
+
+cor_mat <- cor(gp_cor, use = "pairwise.complete.obs")
+
+# Plot correlation
+cor_plot <- ggcorrplot(
+  cor_mat,
+  type = "lower",
+  lab = TRUE,
+  lab_size = 3,
+  colors = c("#6D9EC1", "white", "#E46726"),
+  tl.cex = 10,    
+  tl.srt = 45         
+)
+
+
+ggsave(
+  filename = "outputs/correlation_matrix.pdf",
+  plot = cor_plot,
+  width = 12, 
+  height = 10,
+  units = "in",
+  dpi = 600 )
+
+
+cor_plot
+```
+
+## Summary statistics
+
+```{r tab-summary, cache=TRUE}
+
+table_labels = list(
+  den_12m            ~ "Eligible population (12 months)",
+  den_24m            ~ "Eligible population (24 months)",
+  den_5y             ~ "Eligible population (5 years)",
+  mmr1_24m           ~ "% MMR1 uptake at 24 months",
+  mmr1_5y            ~ "% MMR1 uptake at 5 years",
+  mmr2_5y            ~ "% MMR2 uptake at 5 years",
+  six_in_one         ~ "% 6-in-1 vaccine uptake",
+  rota               ~ "% Rotavirus vaccine uptake",
+  pcv_boost          ~ "% PCV booster uptake",
+  imd_2025           ~ "IMD score (2025)",
+  pct_black          ~ "% Black/Black British",
+  pct_asian          ~ "% Asian/Asian British",
+  pct_mixed          ~ "% Mixed ethnicity",
+  pct_other          ~ "% Other ethnicity",
+  pct_boys_0_4       ~ "% Boys aged 0-4",
+  appoint_per_patient ~ "Appointments per patient",
+  qof                ~ "QOF score",
+  caring             ~ "% of patients with caring responsibilities",
+  satisfied          ~ "% Patient satisfaction", 
+  distance           ~ "Average distance from GP (km)"
+)
+
+table_vars <- c(
+  "den_12m", "den_24m", "den_5y",
+  "mmr1_24m", "mmr1_5y", "mmr2_5y",
+  "six_in_one", "rota", "pcv_boost",
+  "imd_2025", "interv", "pct_black", "pct_asian", "pct_mixed", "pct_other", "pct_boys_0_4",
+  "appoint_per_patient", "qof", "caring", "satisfied", "distance"
+)
+
+tbl_sum <- gp %>%
+  filter(time >=13 & time<= 18) %>%
+  select(all_of(table_vars)) %>%
+  mutate(interv = factor(interv, 
+                         levels = c(1, 0), 
+                         labels = c("Intervention", "Synthetic control"))) %>%
+  gtsummary::tbl_summary(
+    by = interv, 
+    label = table_labels,
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})", 
+                     c(den_12m, den_24m, den_5y) ~ "{sum} [{median} ({p25}, {p75})]"
+                     ),
+    missing = "no"
+  ) %>%
+  gtsummary::modify_header(
+    label ~ "", 
+    stat_1 ~ glue("**Intervention GPs** \n(n = {length(unique(gp$gpcode[gp$interv == 1]))} practices)"),
+    stat_2 ~ glue("**GPs in the rest of England** \n(n = {length(unique(gp$gpcode[gp$interv == 0]))} practices)")) %>% 
+  gtsummary::modify_footnote(
+    label ~ NA_character_ ,
+    stat_1 ~ NA_character_ ,
+    stat_2 ~ NA_character_ )
+
+
+tbl_sum  <- tbl_sum %>% as_flex_table() %>% 
+
+  flextable::footnote(
+    i = 1, j = c("stat_1", "stat_2"),
+    value = as_paragraph(c("Intervention practices within 1 km of intervention sites", "Non-intervention practices used to generate the synthetic control group")),
+    ref_symbols = c("†", "‡"),
+    part = "header") %>% 
+  
+flextable::footnote(
+  i = c(1,2,3), 
+  j = "label", 
+  value = as_paragraph(c("Sum across quarters [median (25th, 75th percentiles)]; eligible population counts allow repeat inclusion of the same child across age groups; a child counted at 12 months could be counted again at 24 months and at 5 years.")), 
+  ref_symbols = "*", 
+  part = "body")  %>%
+  
+  flextable::add_footer_lines(
+    values = c(
+      "GP = General Practice; MMR = measles, mumps and rubella vaccine; 6-in-1 = diphtheria, tetanus, pertussis, polio, haemophilus influenzae type b, and hepatitis B; PCV = pneumococcal conjugate vaccine booster dose; IMD = Index of Multiple Deprivation; QOF = Quality and Outcomes Framework.")) %>%
+  
+  flextable::add_footer_lines(top = TRUE, 
+    values = c(
+      "Data is presented as median (25th, 75th percentiles) except for population where the total is presented first, followed by median per practice"))
+
+save_as_docx(tbl_sum, path = "outputs/Table1_table_summary.docx")
+
+tbl_sum
+
+```
+
+```{r eval=TRUE, echo=FALSE}
+all_objs <- ls()
+
+interv_obj <- all_objs[str_detect(all_objs, "^interv_")]
+
+radius_label <- str_extract(interv_obj, "(?<=_).*")
+
+saveRDS(gp, "data/analysis_data.rds")
+
+```
+
+## 1km Buffer Distance Models
+
+We first ran a Microsynth model for the three main outcomes, using GPs within `r radius_label` from intervention sites as intervention practices followed by a model combining all 6 outcomes.
+
+**Model parameters**:
+
+-   start.pre = 1, end.pre = 18 (1 to 18 is preintervention period)
+
+-   end.post = 24 (19 to 24 is postintervention period)
+
+-   Confidence level at 95%
+
+-   Time-invariant covariates:
+
+    `r paste("  - ", c( "Percentage of male children aged 0-4 years", "Average number of GP appointments per patient", "Quality and Outcomes Framework (QOF) score", "Patient-reported satisfaction with GP services", "Patient-reported caring responsibilities", "Index of Multiple Deprivation (IMD) 2025 score", "Percentage of population identifying as Black", "Percentage of population identifying as Asian", "Percentage of population identifying as Mixed ethnicity", "Average distance from GP to the intervention site (km)"), collapse = "\n  ")`
+
+The estimated intervention effect produced by microsynth represents the difference in aggregate vaccine uptake between the treated group and its synthetic control during the postintervention period. This is calculated as:
+
+$$
+\text{Estimated Effect (% change)} = \frac{\text{Treated} - \text{Synthetic Control}}  { \text{Synthetic Control}} \times 100
+$$
+
+To visualise uncertainty around the synthetic control estimates, we used the `survey` package and the synthetic control weights from the `Microsynth` model.
+
+This was implemented using `svydesign()` and `svyratio()` as follows:
+
+-   The `Weights` matrix (`model$w$Weight`) was extracted from the `Microsynth` model and merged back to the original dataset by GP code.
+-   A survey design object was created using the extracted weights with `svydesign()`.
+-   For each time point $t$ and each outcome $Y$, we calculated the vaccination **uptake rate** as the **ratio** of the count of vaccinated children to the denominator using `svyratio()` (i.e., ration of weighted sums).
+-   95% confidence intervals were derived from the standard errors using the normal approximation:
+
+$$
+CI_t^{95\%} = \hat{P}_t \pm 1.96 \cdot SE(\hat{P}_t)
+$$
+
+where:
+
+-   $\hat{p}_t$ is the survey weighted vaccination uptake rate at time $t$, estimated via `svyratio()`,\
+-   $SE(\hat{P}_t)$ is the standard error of the ratio estimated from the survey design.
+
+> NOTE: Excluding `funding` and `workforce` improved balance between the intervention and synthetic control groups. We believe this is due to how these variables were measured: both were aggregated at the PCN level and applied uniformly to all GPs within that PCN. As a result, these variables might fail to capture the GP level variation.
+
+### Main Model
+
+```{r, cache=TRUE}
+source("scripts/functions.R")
+
+gp <- readRDS("data/analysis_data.rds")
+
+interv_1km <- readRDS("data/interv_gp/1km_interv.rds")
+
+
+gp <- gp %>%  
+  mutate(
+    interv = case_when(gpcode %in% interv_1km  ~ 1, 
+                       TRUE ~ 0)
+  )
+
+# Main model --------------------------
+## MMR-----------------------
+
+set.seed(12913)
+
+# Time-invariant covariates
+cov.var <- c(
+  'pct_boys_0_4', 'appoint_per_patient',
+  'qof', 'satisfied', "caring", 'imd_2025',
+  'pct_black', 'pct_asian', 'pct_mixed', 'distance')
+
+
+# Time-varying co-variates 
+match.out <- c("i_mmr1_24m", "i_mmr1_5y", "i_mmr2_5y", "den_24m", "den_5y")    
+
+# Result variable 
+result.var <- c("i_mmr1_24m", "i_mmr1_5y", "i_mmr2_5y")     
+
+
+count_1km_main <- run_microsynth(gp , idvar = "gpcode", timevar = "time", 
+                             intvar = "interv", start.pre = 1, end.pre = 18, end.post = 24,
+                             match.out = match.out, match.covar = cov.var, result.var = result.var,
+                             test = "twosided", n.cores = 1, use.backup = T, omnibus.var = NULL, perm = 250, confidence = 0.95)
+
+summary(count_1km_main) 
+
+
+## other vaccines ----------------
+set.seed(12913)
+
+# Time-invariant covariates
+cov.var <- c(
+  'pct_boys_0_4', 'appoint_per_patient',
+  'qof', 'satisfied', "caring", 'imd_2025',
+  'pct_black', 'pct_asian', 'pct_mixed', 'distance')
+
+# Time-varinat covariates (including outcomes)
+match.out <- c("i_rota", "i_six_in_one", "i_pcv_boost", "den_12m", "den_24m")    
+
+# Result variable 
+result.var <- c("i_rota", "i_six_in_one", "i_pcv_boost")     
+
+
+count_1km_main_other <- run_microsynth(gp , idvar = "gpcode", timevar = "time", 
+                                   intvar = "interv", start.pre = 1, end.pre = 18, end.post = 24,
+                                   match.out = match.out, match.covar = cov.var, result.var = result.var,
+                                   test = "twosided", n.cores = 1, use.backup = T, omnibus.var = NULL, perm = 250, confidence = 0.95)
+
+
+### ---- table 
+count_1km_main_tbl <- extract_syn_results(count_1km_main, count_1km_main_other) %>% 
+  gt() %>% 
+  tab_header(title = "Estimated Intervention Effects on the Count of Vaccinated Children")
+
+count_1km_main_tbl
+
+gtsave(count_1km_main_tbl, filename = "outputs/count_1km_main_tbl.docx")
+
+### figure -------
+# custom function to extract the data out of the model and plot using ggplot
+out_den <- c(
+  "i_mmr1_24m" = "den_24m",
+  "i_mmr1_5y"  = "den_5y",
+  "i_mmr2_5y"  = "den_5y")
+
+p_count_1km_main  <- extract_svy_ratios(count_1km_main, outcome_denom_map = out_den)
+
+count_1km_main_plot  <- plot_svy_ratios(p_count_1km_main, ncol = 1, endpre = count_1km_main$info$end.pre)
+
+# Other vaccines 
+
+out_den <- c(
+  "i_rota"     =  "den_12m", 
+  "i_six_in_one"  =  "den_12m",
+  "i_pcv_boost" = "den_24m"
+)
+
+p_count_1km_main_other  <- extract_svy_ratios(count_1km_main_other, outcome_denom_map = out_den)
+
+count_1km_main_plot_other <- plot_svy_ratios(p_count_1km_main_other, ncol = 1, endpre = count_1km_main_other$info$end.pre)
+
+(count_1km_main_plot + count_1km_main_plot_other) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom")
+
+ggsave(plot = last_plot(),  filename = "outputs/count_1km_main_plot.pdf",
+  width = 12, 
+  height = 10,
+  units = "in")
+
+```
+
+
+### Exclude Model
+
+Given the community-based nature of the intervention, there is potential for spillover effects beyond the identified intervention practices. To mitigate this effect, we will conduct a sensitivity analysis excluding other non-intervention GPs located within the central and north Liverpool PCNs from the donor pool practices used to create the synthetic control group.
+
+```{r, cache=TRUE}
+## MMR -----
+set.seed(12913)
+gp_all <- readRDS("data/GP_MMR_IMD_ICB_POP_FING_ETHN_dist.rds")
+
+
+c_n_gpcodes <- gp_all %>% filter(pcn_name %in% c("NORTH LIVERPOOL PCN", "CENTRAL LIVERPOOL PCN") ) %>%
+  select(gpcode) %>% distinct() %>% pull()
+
+c_n_gpcodes <- setdiff(c_n_gpcodes, interv_1km)
+
+# Time-invariant covariates
+cov.var <- c(
+  'pct_boys_0_4', 'appoint_per_patient',
+  'qof', 'satisfied', "caring", 'imd_2025',
+  'pct_black', 'pct_asian', 'pct_mixed', 'distance')
+
+# # Time-varying co-variates 
+match.out <- c("i_mmr1_24m", "i_mmr1_5y", "i_mmr2_5y", "den_24m", "den_5y")    
+
+# Result variable 
+result.var <- c("i_mmr1_24m", "i_mmr1_5y", "i_mmr2_5y")    
+
+
+count_1km_exgp <- run_microsynth(gp %>% 
+                               filter(time >= 13 & gpcode %notin% c_n_gpcodes), 
+                             idvar = "gpcode", timevar = "time", 
+                             intvar = "interv", start.pre = 13, end.pre = 19, 
+                             end.post = 24, match.out = match.out, match.covar = cov.var,
+                             result.var = result.var, test = "twosided", n.cores = 1, use.backup = T,
+                             omnibus.var = NULL, perm = 250, confidence = 0.95)
+
+
+## Other vaccines -------
+set.seed(12913)
+
+
+# Time-invariant covariates
+cov.var <- c(
+  'pct_boys_0_4', 'appoint_per_patient',
+  'qof', 'satisfied', "caring", 'imd_2025',
+  'pct_black', 'pct_asian', 'pct_mixed', 'distance')
+
+# Time-varinat covariates (including outcomes)
+match.out <- c("i_rota", "i_six_in_one", "i_pcv_boost", "den_12m", "den_24m")    
+
+# Result variable 
+result.var <- c("i_rota", "i_six_in_one", "i_pcv_boost")     
+
+
+count_1km_exgp_other <- run_microsynth(gp %>% 
+                                     filter(time >= 13 & gpcode %notin% c_n_gpcodes), 
+                                   idvar = "gpcode", timevar = "time", 
+                                   intvar = "interv", start.pre = 13, end.pre = 19, 
+                                   end.post = 24, match.out = match.out, match.covar = cov.var,
+                                   result.var = result.var, test = "twosided", n.cores = 1, use.backup = T, 
+                                   omnibus.var = NULL, perm = 250, confidence = 0.95)
+
+
+
+
+### table -----
+count_1km_exgp_tbl <- extract_syn_results(count_1km_exgp, count_1km_exgp_other) %>% 
+  gt() %>% 
+  tab_header(
+    title = "Estimated Intervention Effects on Vaccination Counts",
+    subtitle = "Model excludes practices from Central & North Liverpool PCNs"
+  ) %>%
+  tab_footnote(
+    footnote = glue(
+      "Model parameters: start.pre = {count_1km_exgp$info$start.pre}, ",
+      "end.pre = {count_1km_exgp$info$end.pre}, ",
+      "end.post = {count_1km_exgp$info$end.post}"),
+    locations = cells_title(groups = "subtitle"))
+
+
+count_1km_exgp_tbl
+
+
+
+gtsave(count_1km_exgp_tbl, filename = "outputs/count_1km_exgp_tbl.docx")
+
+
+### Plots -------
+out_den <- c(
+  "i_mmr1_24m" = "den_24m",
+  "i_mmr1_5y"  = "den_5y",
+  "i_mmr2_5y"  = "den_5y")
+
+p_count_1km_exgp  <- extract_svy_ratios(
+  count_1km_exgp, outcome_denom_map = out_den,  synth.df = gp %>% 
+    filter(time >= 13 & gpcode %notin% c_n_gpcodes))
+
+count_1km_exgp_plot <- plot_svy_ratios(p_count_1km_exgp, ncol = 1, endpre = count_1km_exgp$info$end.pre)
+
+
+
+out_den <- c(
+  "i_rota"     =  "den_12m", 
+  "i_six_in_one"  =  "den_12m",
+  "i_pcv_boost" = "den_24m"
+)
+
+p_count_1km_exgp_other  <- extract_svy_ratios(
+  count_1km_exgp_other, outcome_denom_map = out_den,  synth.df = gp %>% 
+    filter(time >= 13 & gpcode %notin% c_n_gpcodes))
+
+count_1km_exgp_plot_other <- plot_svy_ratios(p_count_1km_exgp_other, ncol = 1, 
+                                             endpre = count_1km_exgp_other$info$end.pre)
+
+(count_1km_exgp_plot + count_1km_exgp_plot_other) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom")
+
+
+ggsave(plot = last_plot(),  filename = "outputs/count_1km_exgp_plot.pdf",
+  width = 12, 
+  height = 10,
+  units = "in",
+  dpi = 600 )
+```
+
+
+## 1.5 km Buffer Distance Models
+
+```{r, cache=TRUE}
+source("scripts/count_1.5km.R")
+```
+
+
+```{r tab-count_1.5km_exgp, cache=TRUE}
+count_1.5km_exgp_tbl
+
+
+(count_1.5km_exgp_plot + count_1.5km_exgp_plot_other) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom")
+
+
+ggsave(plot = last_plot(),  filename = "outputs/count_1.5km_exgp_plot.pdf",
+  width = 12, 
+  height = 10,
+  units = "in",
+  dpi = 600 )
+```
+
+## 0.5 km Buffer Distance Models
+
+```{r, cache=TRUE}
+source("scripts/count_0.5km.R")
+```
+
+
+```{r tab-count_0.5km_exgp, cache=TRUE}
+count_0.5km_exgp_tbl
+
+
+(count_0.5km_exgp_plot + count_0.5km_exgp_plot_other) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "bottom")
+
+ggsave(plot = last_plot(),  filename = "outputs/count_0.5km_exgp_plot.pdf",
+  width = 12, 
+  height = 10,
+  units = "in",
+  dpi = 600 )
+```
+
+## Forest plots of all results
+
+```{r fig.width=18, fig.height=10, out.width="100%", cache=TRUE}
+source("scripts/functions.R")
+# 
+
+# Count based models with 1km buffer
+all_models <- list(
+count_1km_exgp, count_1km_exgp_other
+)
+
+fplot_count_1km <- forest_plot_results(all_models = all_models, title = NULL, show_model = FALSE) 
+fplot_count_1km 
+
+
+ggsave(plot = last_plot(),  filename = "outputs/fplot_count_1km.pdf",
+  width = 8.5, 
+  height = 2.5,
+  units = "in",
+  dpi = 600)
+
+
+# Count based models with 0.5 and 1.5km buffer
+all_models <- list(
+    `0.5km Model`  = list(count_0.5km_exgp, count_0.5km_exgp_other),
+  
+  `1.5km Model` = list(count_1.5km_exgp, count_1.5km_exgp_other)
+)
+
+
+fplot_count_0.5_1.5km  <- forest_plot_results(all_models = all_models,  title = NULL)
+
+fplot_count_0.5_1.5km 
+
+
+ggsave(plot = last_plot(),  filename = "outputs/fplot_count_0.5_1.5km.pdf",
+  width = 9.8, 
+  height = 4.5 ,
+  units = "in",
+  dpi = 600)
+
+```
+
+# Results
+
+## Descriptives
+
+```{r , cache=TRUE, eval=TRUE, echo=FALSE}
+
+gp <- readRDS("data/analysis_data.rds")
+
+interv_1km <- readRDS("data/interv_gp/1km_interv.rds")
+
+
+gp <- gp %>%  
+  mutate(
+    interv = case_when(gpcode %in% interv_1km  ~ 1, 
+                       TRUE ~ 0)) %>% filter(time >= 13 & time <= 18)
+
+
+count_gps <- gp %>% distinct(gpcode) %>% nrow()
+
+count_interv_gp <- gp %>% filter(interv == 1) %>% distinct(gpcode) %>% nrow()
+
+count_control_gp <- gp %>% filter(interv == 0) %>% distinct(gpcode) %>% nrow()
+
+
+vac_means <- gp %>% filter(time >= 13 & time <= 18) %>% 
+  group_by(interv) %>% 
+  summarise(mmr1_24m =   round(mean(mmr1_24m), digits = 0), 
+            mmr1_5y =    round(mean(mmr1_5y), digits = 0), 
+            mmr2_5y =    round(mean(mmr2_5y), digits = 0),
+            six_in_one = round(mean(six_in_one), digits = 0),
+            rota =       round(mean(rota), digits = 0),
+            pcv =        round(mean(pcv_boost), digits = 0),
+            imd =        round(mean(imd_2025), digits = 0),
+            black =      round(mean(pct_black), digits = 0),
+            asian =      round(mean(pct_asian), digits = 0),
+            mixed =      round(mean(pct_mixed), digits = 0),
+            other =      round(mean(pct_other), digits = 0),
+            qof =        round(mean(qof), digits = 0),
+            pct_boys =   round(mean(pct_boys_0_4), digits = 0),
+            count_0_4 =  sum(count_0_4),
+             .groups = 'drop'
+           )   
+
+vac_medians <- gp %>% filter(time >= 13 & time <= 18) %>% 
+  group_by(interv) %>% 
+  summarise(mmr1_24m =   round(median(mmr1_24m), digits = 0), 
+            mmr1_5y =    round(median(mmr1_5y), digits = 0), 
+            mmr2_5y =    round(median(mmr2_5y), digits = 0),
+            six_in_one = round(median(six_in_one), digits = 0),
+            rota =       round(median(rota), digits = 0),
+            pcv =        round(median(pcv_boost), digits = 0),
+            imd =        round(median(imd_2025), digits = 0),
+            black =      round(median(pct_black), digits = 0),
+            asian =      round(median(pct_asian), digits = 0),
+            mixed =      round(median(pct_mixed), digits = 0),
+            other =      round(median(pct_other), digits = 0),
+            qof =        round(median(qof), digits = 0),
+            pct_boys =   round(median(pct_boys_0_4), digits = 0),
+            count_0_4 =  sum(count_0_4),
+             .groups = 'drop'
+           )  
+
+
+gp <- readRDS("data/analysis_data.rds")
+
+interv_1km <- readRDS("data/interv_gp/1km_interv.rds")
+
+gp <- gp %>%  
+  mutate(
+    interv = case_when(gpcode %in% interv_1km  ~ 1, 
+                       TRUE ~ 0)) %>% filter(time >= 13)
+```
+
+**Figure 2** shows the flow diagram of study inclusion. The final analytic sample included `r count_gps` GP practices, contributing a total eligible populations of `r scales::comma(sum(gp$den_12m))` children at 12 months, `r scales::comma(sum(gp$den_24m))` at 24 months, and `r scales::comma(sum(gp$den_5y))` at 5 years. Using the 1 km buffer, `r count_interv_gp` practices (`r scales::comma(sum(gp$den_12m[gp$interv==1]))` children at 12 months, `r scales::comma(sum(gp$den_24m[gp$interv==1]))` at 24 months, and `r scales::comma(sum(gp$den_5y[gp$interv==1]))` at 5 years) defined the intervention group and the remaining `r count_control_gp` practices contributed to constructing the synthetic control group.
+
+**Table 1** summarises the baseline characteristics during the pre-intervention period (Q13-Q18). The median uptake rates across all vaccines were lower in intervention practices than in non-intervention practices. The largest difference was observed for MMR2 at 5 years, with intervention practices averaging `r vac_medians[2, "mmr2_5y"]`% compared with `r vac_medians[1, "mmr2_5y"]`% in the non-intervention group. A similar pattern was observed for MMR1 at 24 months, Rotavirus, and PCV vaccines, where median uptake in intervention practices was lower (`r vac_medians[2, "mmr1_24m"]`%, `r vac_medians[2, "rota"]`%, and `r vac_medians[2, "pcv"]`%) compared with non-intervention practices (`r vac_medians[1, "mmr1_24m"]`%, `r vac_medians[1, "rota"]`%, and `r vac_medians[1, "pcv"]`%). Smaller differences noted for the remaining vaccines.
+
+On average, intervention practices served more socioeconomically disadvantaged populations, reflected by a higher median IMD score (intervention: `r vac_medians[2, "imd"]`, non-intervention: `r vac_medians[1, "imd"]`), and had a greater proportion of ethnic minority groups, including Black, Asian, and Mixed ethnicities. The proportions of boys were similar across groups at `r round(median(gp$pct_boys_0_4))`%. Practice level characteristics and patient-reported measures were also comparable, including the average number of appointments and satisfaction with GP services. However, intervention practices showed slightly lower achievement in the QOF (intervention: `r vac_medians[2, "qof"]`, non-intervention: `r vac_medians[1, "qof"]`).
+
+## Statistical analysis
+
+```{r, echo=FALSE}
+onekm_mmr1_24m_main <- extract_effect(count_1km_main, "i_mmr1_24m")
+onekm_mmr1_5y_main  <- extract_effect(count_1km_main, "i_mmr1_5y")
+onekm_mmr2_5y_main  <- extract_effect(count_1km_main, "i_mmr2_5y")
+
+
+onekm_mmr1_24m_exgp <- extract_effect(count_1km_exgp, "i_mmr1_24m")
+onekm_rota_exgp     <- extract_effect(count_1km_exgp_other, "i_rota")
+onekm_six_exgp      <- extract_effect(count_1km_exgp_other, "i_six_in_one")
+
+one_halfkm_rota_exgp     <- extract_effect(count_1.5km_exgp_other, "i_rota")
+one_halfkm_six_exgp      <- extract_effect(count_1.5km_exgp_other, "i_six_in_one")
+
+one_half_km<- readRDS("data/interv_gp/1.5km_interv.rds") %>% length()
+half_km<- readRDS("data/interv_gp/0.5km_interv.rds") %>% length()
+
+
+#Number of excluded GPs in Exclude model
+gp_all <- readRDS("data/GP_MMR_IMD_ICB_POP_FING_ETHN_dist.rds")
+
+c_n_gpcodes <- gp_all %>% filter(pcn_name %in% c("NORTH LIVERPOOL PCN", "CENTRAL LIVERPOOL PCN") ) %>%
+  select(gpcode) %>% distinct() %>% pull()
+
+c_n_gpcodes <- setdiff(c_n_gpcodes, interv_1km)
+exgpcode_1km <- c_n_gpcodes %>% length()
+
+```
+
+
+Figure 3 presents the trends in average uptake rates for all outcomes in the intervention and synthetic control groups between April 2022 (Q13) and March 2025 (Q24) under the primary model specification. The model achieved an optimal pre-intervention balance (epsilon = `r dplyr::coalesce(as.character(round(count_1km_exgp$info$eps, 2)), "zero")`), with both groups showing identical uptake trajectories across all vaccines (as well as matched on covariates to have equivalent characteristics).
+
+Following implementation of the HELP intervention,  significant improvements were observed in early-stage infant vaccinations. Uptake of the Rotavirus vaccine increased by `r glue("{onekm_rota_exgp$pct}%")` (95% CI `r glue("{onekm_rota_exgp$lci}% to {onekm_rota_exgp$uci}%")`) in the intervention group compared to the synthetic control (Figure 4), corresponding to an estimated  `r round(onekm_rota_exgp$abs_diff)` additional vaccinated infants (95% CI `r round(onekm_rota_exgp$abs_diff_lcl)` to `r round(onekm_rota_exgp$abs_diff_ucl)`). As shown in Figure 3, this was reflected as an immediate sharp increase in the uptake trajectory, which subsequently moderated over the following nine months. A comparable gain was observed for the 6-in-1 vaccine, where uptake rose by `r glue("{onekm_six_exgp$pct}%")` (95% CI `r glue("{onekm_six_exgp$lci}% to {onekm_six_exgp$uci}%")`), equivalent to approximately `r round(onekm_six_exgp$abs_diff)` additional vaccinated children (95% CI `r round(onekm_six_exgp$abs_diff_lcl)` to `r round(onekm_six_exgp$abs_diff_ucl)`).
+
+In contrast, the intervention did not yield statistically significant changes for MMR1 (at 2 or 5 years), MMR2 (at 5 years), or the PCV booster dose. **Figure 4** illustrates the spatial distribution of the non-intervention practices contributing to the synthetic control construction, along with their corresponding matching weights.
+
+When we redefined practices’ exposure status using 0.5km and 1.5km proximity from HELP delivery sites, the intervention group included  `r half_km` and `r one_half_km`, respectively (**Supplementary Figure 2**). Model using the 0.5 km buffer produced poor pre-intervention balance (epsilon = `r dplyr::coalesce(as.character(round(count_0.5km_exgp$info$eps, 2)), "zero")`) and therefore did not yield reliable estimates (**Supplementary Figure 3**). Meanwhile, the 1.5 km specification achieved an exact pre-intervention match (**Supplementary Figure 4**). Under this specification, significant increases were observed in uptake of both the Rotavirus vaccine `r glue("({one_halfkm_rota_exgp$pct}%, 95% CI {one_halfkm_rota_exgp$lci}% to {one_halfkm_rota_exgp$uci}%)")` and the 6-in-1 vaccine `r glue("({one_halfkm_six_exgp$pct}%, 95% CI {one_halfkm_six_exgp$lci}% to {one_halfkm_six_exgp$uci}%)")` following the intervention implementation (**Supplementary Figure 5**).
+
+In general, the matching quality across buffer distances showed a sharp decline in imbalance (epsilons) with increasing spatial radius, which subsequently increased the number of intervention units. The 1 km radius was the smallest at which a fully balanced synthetic control could be achieved (**Supplementary Table 1, Supplementary Figure 6**).
+
+# Session info
+
+```{r session-info, echo=TRUE, cache=FALSE}
+
+sessionInfo()$otherPkgs %>% 
+  purrr::imap_dfr(~ tibble::tibble(
+    package = .y,
+    version = .x$Version
+  )) %>% as.data.frame()
+
+```
